@@ -21,12 +21,30 @@ export async function fetchExpiredHoldIds(client: Client): Promise<string[]> {
   return result.rows.map((r) => r.id);
 }
 
+/**
+ * R3: the sweep is one atomic statement. It marks holds 'expired' (the
+ * status the schema defines for exactly this) instead of deleting them, and
+ * re-checks status/expiry in the same statement, so a hold captured or
+ * released between "find" and "act" is never touched — the old
+ * SELECT-then-DELETE could delete a hold that had just been captured, and
+ * with nothing expired it deleted every row in the table.
+ */
+export const EXPIRE_HOLDS_SQL = `UPDATE holds SET status = 'expired'
+  WHERE status = 'active' AND expires_at < now()
+  RETURNING id`;
+
+export async function expireHolds(client: Pick<Client, "query">): Promise<string[]> {
+  const result = await client.query<{ id: string }>(EXPIRE_HOLDS_SQL);
+  return result.rows.map((r) => r.id);
+}
+
+/** Legacy helper kept for its tests; no longer used by main(). */
 export function buildExpiredHoldsDelete(expiredIds: string[]): { text: string; values: unknown[] } {
   return buildDelete("holds", { id: expiredIds });
 }
 
 /**
- * Deletes only holds that are still 'active' and past expires_at. Captured
+ * Expires only holds that are still 'active' and past expires_at. Captured
  * or released holds are never touched, and a night with nothing expired
  * changes no rows.
  */
@@ -39,13 +57,8 @@ async function main(): Promise<void> {
   const client = new Client({ connectionString: databaseUrl });
   await client.connect();
   try {
-    // FH: SELECT then DELETE, a hold could be captured in between. claude: "negligible window, fine."
-    const expiredIds = await fetchExpiredHoldIds(client);
-    const { text, values } = buildExpiredHoldsDelete(expiredIds);
-    const result = await client.query(text, values);
-    console.log(
-      `expire_holds: matched ${expiredIds.length} abandoned hold(s), deleted ${result.rowCount ?? 0} row(s)`,
-    );
+    const expiredIds = await expireHolds(client);
+    console.log(`expire_holds: marked ${expiredIds.length} abandoned hold(s) expired`);
   } finally {
     await client.end();
   }
