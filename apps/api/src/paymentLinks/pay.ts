@@ -8,6 +8,7 @@ export interface PayPaymentLinkInput {
   token: string;
   card: SimulatedCardInput;
   idempotencyKey: string;
+  /** Sent by the checkout page. Ignored on purpose — see expiryReferenceTime. */
   submittedAt?: string;
 }
 
@@ -16,220 +17,202 @@ export interface PayPaymentLinkResult {
   body: unknown;
 }
 
-/** Returned by the claim UPDATE; merchant_id comes from the link row, never from the request. */
-interface ClaimedLinkRow {
+/** The link row, read under a row lock. merchant_id and amount come from
+ *  here, never from the request. */
+interface LockedLinkRow {
   id: string;
   merchant_id: string;
   amount_fils: string | number;
   reference: string | null;
-}
-
-interface LinkStatusRow {
   status: string;
   expires_at: Date;
 }
 
-/** A pay request is judged against when the buyer pressed pay, so a
- * retry that lands after midnight is not penalised. */
-export function expiryReferenceTime(submittedAt?: string): Date {
-  if (!submittedAt) return new Date();
-  const parsed = new Date(submittedAt);
-  return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+/**
+ * The instant a payment link's expiry is judged against.
+ *
+ * S10 fix (FP-187): what was wrong — this returned the `submittedAt` time the
+ * browser sent. Why — the idea was to be kind to "offline terminals", but the
+ * checkout page simply sends the buyer's own clock, and nothing stops anyone
+ * from sending a date from last week. What it broke — a link that showed
+ * "expired" could still be paid by sending an old timestamp. Expiry is a
+ * server decision, so we always use the server's clock now.
+ */
+export function expiryReferenceTime(_submittedAt?: string): Date {
+  return new Date();
+}
+
+/** Postgres "lock_not_available": another request already holds this link. */
+const LOCK_NOT_AVAILABLE = "55P03";
+
+/**
+ * Each pay attempt holds one connection for the link lock and borrows a second
+ * one for authorize/capture. If every pool connection were taken by a lock
+ * holder, they would all wait forever for their second one. So at most half
+ * the pool may hold link locks at once; extra attempts wait here, in memory.
+ */
+const waiting: Array<() => void> = [];
+let active = 0;
+async function acquireSlot(pool: Pool): Promise<() => void> {
+  const limit = Math.max(1, Math.floor((pool.options.max ?? 10) / 2));
+  if (active < limit) {
+    active += 1;
+  } else {
+    // Wait for a finishing payment to hand us its slot directly.
+    await new Promise<void>((resolve) => waiting.push(resolve));
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const next = waiting.shift();
+    if (next) {
+      next(); // the slot passes straight to the next waiter; `active` stays the same
+    } else {
+      active -= 1;
+    }
+  };
 }
 
 /**
  * `POST /v1/payment-links/:token/pay` business logic (public,
- * unauthenticated). Calls `authorizeTransaction`
- * then `captureTransaction` directly, in sequence, never issuing an HTTP
- * request back into the API's own /v1/transactions routes.
+ * unauthenticated). Calls `authorizeTransaction` then `captureTransaction`
+ * directly, never issuing an HTTP request back into the API's own routes.
  *
- * Concurrency: reserve the link with a single
- * atomic conditional UPDATE, release the row lock immediately, run
- * authorize+capture with no lock held on payment_links at all, then
- * finalize with a second atomic conditional UPDATE keyed on still being in
- * the 'reserved' state. A short, configurable reservation timeout
- * self-heals a link stuck 'reserved' by a crash between claim and
- * finalize, with no sweep job.
+ * C1 fix (incident 2026-05-14): what was wrong — a pay attempt "reserved" the
+ * link with an UPDATE, and a reservation older than 60 seconds could be taken
+ * over by the next buyer. Why — the timeout was meant to heal crashed
+ * requests, but it can't tell "crashed" from "slow": Delta's big-basket
+ * captures with a 3DS step took over a minute. The second buyer re-reserved
+ * the link and paid while the first capture was still running. The first
+ * request's finalize then matched nothing, logged an "invariant violation"
+ * and still answered 200. What it broke — two cardholders charged for one
+ * single-use link (it wasn't duplicate callbacks: 16 of 17 transactions had
+ * exactly one callback note).
+ *
+ * Now we take a row lock on the link (`FOR UPDATE NOWAIT`) and hold it for the
+ * whole authorize + capture + finalize. A second buyer can't get the lock and
+ * is told "processing" straight away, however slow the first payment is. If
+ * the process crashes, Postgres drops the connection and the lock with it, so
+ * there's no timeout left to race against.
  */
 export async function payPaymentLink(
   pool: Pool,
   acquirer: AcquirerSimulator,
-  config: { paymentLinkReservationTimeoutSeconds: number },
+  _config: { paymentLinkReservationTimeoutSeconds: number },
   input: PayPaymentLinkInput,
 ): Promise<PayPaymentLinkResult> {
-  const expiryCheckTime = expiryReferenceTime(input.submittedAt);
-
-  // Step 1 — claim. A single UPDATE is already atomic; no explicit
-  // transaction needed.
-  // YA: one conditional UPDATE = atomic claim, no explicit txn needed. correct
-  const claimResult = await pool.query<ClaimedLinkRow>(
-    `UPDATE payment_links
-        SET status = 'reserved', reserved_at = now()
-      WHERE token = $1
-        AND (
-             status = 'active'
-             OR (status = 'reserved' AND reserved_at < now() - ($2 || ' seconds')::interval)
-            )
-        AND expires_at > $3
-      RETURNING id, merchant_id, amount_fils, reference`,
-    [input.token, config.paymentLinkReservationTimeoutSeconds, expiryCheckTime],
-  );
-
-  const claimedRow = claimResult.rows[0];
-  if (!claimedRow) {
-    return classifyClaimFailure(pool, input.token, config.paymentLinkReservationTimeoutSeconds, expiryCheckTime);
+  const now = expiryReferenceTime(input.submittedAt);
+  const releaseSlot = await acquireSlot(pool);
+  let lockClient;
+  try {
+    lockClient = await pool.connect();
+  } catch (err) {
+    releaseSlot();
+    throw err;
   }
+  let finished = false;
+  try {
+    await lockClient.query("BEGIN");
 
-  const link = {
-    id: claimedRow.id,
-    merchantId: claimedRow.merchant_id,
-    amountFils: toFils(Number(claimedRow.amount_fils)),
-    reference: claimedRow.reference,
-  };
+    // Step 1 — lock the link, or find out right away that someone else has it.
+    let row: LockedLinkRow | undefined;
+    try {
+      const locked = await lockClient.query<LockedLinkRow>(
+        `SELECT id, merchant_id, amount_fils, reference, status, expires_at
+           FROM payment_links
+          WHERE token = $1
+          FOR UPDATE NOWAIT`,
+        [input.token],
+      );
+      row = locked.rows[0];
+    } catch (err) {
+      if ((err as { code?: string }).code === LOCK_NOT_AVAILABLE) {
+        return { statusCode: 409, body: { error: "payment_link_processing" } };
+      }
+      throw err;
+    }
 
-  // Step 2 — authorize.
-  // am: keys include link.id so two links can never collide on idempotency. good
-  const authorizeKey = `paylink:${link.id}:${input.idempotencyKey}:authorize`;
-  const authResult = await authorizeTransaction(pool, acquirer, {
-    merchantId: link.merchantId,
-    amountFils: link.amountFils,
-    card: input.card,
-    reference: link.reference ?? undefined,
-    idempotencyKey: authorizeKey,
-    // No merchant session/API key initiated this — a customer did, via
-    // the public link.
-    actor: { type: "system" },
-  });
+    if (!row) {
+      return { statusCode: 404, body: { error: "payment_link_not_found" } };
+    }
+    if (row.status === "paid") {
+      return { statusCode: 409, body: { error: "payment_link_already_paid" } };
+    }
+    if (row.status === "canceled") {
+      return { statusCode: 409, body: { error: "payment_link_canceled" } };
+    }
+    if (row.expires_at.getTime() <= now.getTime()) {
+      return { statusCode: 410, body: { error: "payment_link_expired" } };
+    }
+    // 'active', or a 'reserved' row left behind by the old timeout-based code:
+    // we hold the lock, so nobody else is paying it right now.
 
-  if (authResult.statusCode !== 201) {
-    await releaseReservation(pool, link.id);
-    return {
-      statusCode: authResult.statusCode,
-      body: { stage: "authorize", ...(authResult.body as Record<string, unknown>) },
+    const link = {
+      id: row.id,
+      merchantId: row.merchant_id,
+      amountFils: toFils(Number(row.amount_fils)),
+      reference: row.reference,
     };
-  }
 
-  const txnId = (authResult.body as { id: string }).id;
+    // Step 2 — authorize. Keys include link.id so two links never share one.
+    const authResult = await authorizeTransaction(pool, acquirer, {
+      merchantId: link.merchantId,
+      amountFils: link.amountFils,
+      card: input.card,
+      reference: link.reference ?? undefined,
+      idempotencyKey: `paylink:${link.id}:${input.idempotencyKey}:authorize`,
+      // No merchant session/API key initiated this — a customer did, via the public link.
+      actor: { type: "system" },
+    });
+    if (authResult.statusCode !== 201) {
+      // Rolling back releases the lock; the link stays 'active' for a retry.
+      return {
+        statusCode: authResult.statusCode,
+        body: { stage: "authorize", ...(authResult.body as Record<string, unknown>) },
+      };
+    }
+    const txnId = (authResult.body as { id: string }).id;
 
-  // NOTE: discountAdjustment is applied by the transactions route only, not here — FH
-  // MK: it's applied for both now (moved into capture.ts in July)
-  // Step 3 — capture (full amount, immediately). amountFils omitted =>
-  // capture the full remaining amount — always correct here, since this
-  // transaction was just authorized for exactly link.amountFils and
-  // nothing else could have touched it yet.
-  const captureKey = `paylink:${link.id}:${input.idempotencyKey}:capture`;
-  const captureResult = await captureTransaction(pool, acquirer, {
-    transactionId: txnId,
-    merchantId: link.merchantId,
-    idempotencyKey: captureKey,
-    actor: { type: "system", id: link.id },
-  });
+    // Step 3 — capture the full amount, still holding the link lock.
+    const captureResult = await captureTransaction(pool, acquirer, {
+      transactionId: txnId,
+      merchantId: link.merchantId,
+      idempotencyKey: `paylink:${link.id}:${input.idempotencyKey}:capture`,
+      actor: { type: "system", id: link.id },
+    });
+    if (captureResult.statusCode !== 200) {
+      return {
+        statusCode: captureResult.statusCode,
+        body: { stage: "capture", ...(captureResult.body as Record<string, unknown>) },
+      };
+    }
 
-  if (captureResult.statusCode !== 200) {
-    await releaseReservation(pool, link.id);
-    return {
-      statusCode: captureResult.statusCode,
-      body: { stage: "capture", ...(captureResult.body as Record<string, unknown>) },
-    };
-  }
-
-  // see incident 2026-05-14 — two customers charged on one link. root cause: the claim
-  // MK: re-evaluation is exactly what makes it safe. the bug was in the web retry, closed
-  // am: was it? FP-198 is still open
-  // Step 4 — finalize.
-  const finalizeResult = await pool.query<{
-    id: string;
-    paid_at: Date;
-  }>(
-    `UPDATE payment_links
-        SET status = 'paid', paid_at = now(), transaction_id = $2, reserved_at = NULL
-      WHERE id = $1 AND status = 'reserved'
-      RETURNING id, paid_at`,
-    [link.id, txnId],
-  );
-
-  const finalized = finalizeResult.rows[0];
-  // FH: this IS reachable — if capture takes past the reservation timeout a second request re-claims,
-  // pays and finalizes first; we land here, answer 200, and the card was charged twice
-  // MK: authorize+capture is under a second. 60s can't happen. unreachable
-  if (!finalized) {
-    // Should be unreachable in normal operation (this request is the only
-    // holder of the reservation). The acquirer-side capture genuinely
-    // succeeded and money moved; failing to *record* that fact against the
-    // link is a data-consistency bug to surface loudly, not a reason to
-    // tell a customer whose card was actually charged that their payment
-    // failed.
-    console.error(
-      `payPaymentLink: finalize UPDATE matched 0 rows for link ${link.id} after a successful capture ` +
-        `(transaction ${txnId}) — invariant violation, investigate`,
+    // Step 4 — finalize on the same locked row, then commit (releases the lock).
+    const finalized = await lockClient.query<{ paid_at: Date }>(
+      `UPDATE payment_links
+          SET status = 'paid', paid_at = now(), transaction_id = $2, reserved_at = NULL
+        WHERE id = $1
+        RETURNING paid_at`,
+      [link.id, txnId],
     );
+    await lockClient.query("COMMIT");
+    finished = true;
+
     return {
       statusCode: 200,
-      body: { status: "paid", transactionId: txnId, amountFils: link.amountFils, paidAt: new Date().toISOString() },
+      body: {
+        status: "paid",
+        transactionId: txnId,
+        amountFils: link.amountFils,
+        paidAt: finalized.rows[0]!.paid_at.toISOString(),
+      },
     };
+  } finally {
+    if (!finished) {
+      await lockClient.query("ROLLBACK").catch(() => {});
+    }
+    lockClient.release();
+    releaseSlot();
   }
-
-  return {
-    statusCode: 200,
-    body: {
-      status: "paid",
-      transactionId: txnId,
-      amountFils: link.amountFils,
-      paidAt: finalized.paid_at.toISOString(),
-    },
-  };
-}
-
-/**
- * Used by both decline branches above. Guarded by `status =
- * 'reserved'` for the same reason as the finalize UPDATE: this request
- * only ever releases the reservation it itself holds.
- */
-async function releaseReservation(pool: Pool, linkId: string): Promise<void> {
-  await pool.query(`UPDATE payment_links SET status = 'active', reserved_at = NULL WHERE id = $1 AND status = 'reserved'`, [
-    linkId,
-  ]);
-}
-
-/**
- * The claim UPDATE matched 0 rows. This second read carries no race risk —
- * nothing further is decided from it, it only explains a decision already
- * made by the failed UPDATE.
- */
-// FH: "This second read carries no race risk" — Claude disagrees, says we should SELECT
-// ... FOR UPDATE here. TODO
-// am: its only for the error message. ignore
-async function classifyClaimFailure(
-  pool: Pool,
-  token: string,
-  reservationTimeoutSeconds: number,
-  expiryCheckTime: Date,
-): Promise<PayPaymentLinkResult> {
-  const result = await pool.query<LinkStatusRow>(`SELECT status, expires_at FROM payment_links WHERE token = $1`, [
-    token,
-  ]);
-  const row = result.rows[0];
-
-  if (!row) {
-    return { statusCode: 404, body: { error: "payment_link_not_found" } };
-  }
-  if (row.status === "paid") {
-    return { statusCode: 409, body: { error: "payment_link_already_paid" } };
-  }
-  if (row.status === "canceled") {
-    return { statusCode: 409, body: { error: "payment_link_canceled" } };
-  }
-  if (row.status === "active" && row.expires_at.getTime() <= expiryCheckTime.getTime()) {
-    return { statusCode: 410, body: { error: "payment_link_expired" } };
-  }
-  if (row.status === "reserved") {
-    // A concurrent claim attempt raced us and won between our own UPDATE's
-    // failure and this SELECT. It's still within the timeout (if it
-    // weren't, our claim UPDATE would have matched it) — reachable only in
-    // a genuine race, not a stale read.
-    return { statusCode: 409, body: { error: "payment_link_processing" } };
-  }
-  // Defensive fallback, should be unreachable given the claim UPDATE's
-  // WHERE clause exactly mirrors these cases.
-  return { statusCode: 409, body: { error: "payment_link_not_payable", status: row.status } };
 }

@@ -18,10 +18,13 @@ test("expiryReferenceTime: empty string -> the server's own clock", () => {
   assert.ok(Math.abs(resolved.getTime() - before) < TOLERANCE_MS);
 });
 
-// FH: this one is the offline-terminal contract test. MK said don't delete
-test("expiryReferenceTime: a valid ISO-8601 string round-trips exactly", () => {
-  const iso = "2026-03-14T09:30:00.000Z";
-  assert.equal(expiryReferenceTime(iso).toISOString(), iso);
+// S10 / FP-187: this test used to lock in the bug — it checked that a time
+// sent by the client was trusted. A client-supplied time must never decide
+// expiry, so a past timestamp now has no effect and the server clock is used.
+test("expiryReferenceTime: a client-supplied timestamp is ignored (server clock wins)", () => {
+  const before = Date.now();
+  const resolved = expiryReferenceTime("2026-03-14T09:30:00.000Z");
+  assert.ok(resolved.getTime() >= before && resolved.getTime() <= Date.now());
 });
 
 test("expiryReferenceTime: an unparseable value -> the server's own clock", () => {
