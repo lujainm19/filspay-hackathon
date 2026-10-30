@@ -150,8 +150,8 @@ export async function captureTransaction(
       return { statusCode: 422, body };
     }
 
-    const merchantResult = await client.query<{ mdr_bps: number }>(
-      `SELECT mdr_bps FROM merchants WHERE id = $1`,
+    const merchantResult = await client.query<{ mdr_bps: number; negotiated_discount_bps: number }>(
+      `SELECT mdr_bps, negotiated_discount_bps FROM merchants WHERE id = $1`,
       [input.merchantId],
     );
     const merchant = merchantResult.rows[0];
@@ -193,7 +193,22 @@ export async function captureTransaction(
 
     // outcome === 'approved'. Integer math throughout — no float ever
     // enters this path.
-    const feeFils = applyRateFils(requestedAmount, Math.max(0, effectiveMdrBps - volumeTierBonusBps));
+    //
+    // M9 fix: what was wrong — capture charged the full MDR here, and the
+    // merchant's negotiated discount was knocked off the *fee* later, in a
+    // separate transaction, by the transactions route only. Why it broke —
+    // (1) payment-link captures never got the discount at all, (2) if that
+    // second step failed the capture was already committed without it, and
+    // (3) settlement (Go) takes the discount off the *amount* before applying
+    // MDR (ARCHITECTURE: "Discounts reduce the amount the MDR is charged on"),
+    // which rounds differently. What it broke — the fee in the ledger at
+    // capture didn't match the fee settlement charged, so reconciliation
+    // never tied. The fee is now worked out once, here, inside the capture
+    // transaction, with exactly the same formula as apps/settlement's
+    // ComputeSettlementFee.
+    const discountBps = merchant.negotiated_discount_bps ?? 0;
+    const discountedAmount = subtractFils(requestedAmount, applyRateFils(requestedAmount, discountBps));
+    const feeFils = applyRateFils(discountedAmount, Math.max(0, effectiveMdrBps - volumeTierBonusBps));
     const newCapturedFils = addFils(capturedSoFar, requestedAmount);
     const newStatus = compareFils(newCapturedFils, amountAuthorized) === 0 ? "captured" : "partially_captured";
 
