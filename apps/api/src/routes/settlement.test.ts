@@ -524,3 +524,29 @@ test("M12: a discounted merchant with an unbatched capture and a refund still re
   assert.equal(res.json().gapFils, 0, res.body);
   assert.equal(res.json().explained, true);
 });
+
+// Reconciliation over more than one day (a week, a month): the payout for an
+// earlier day is posted to merchant_payable inside the window. It is money
+// leaving, not earnings, and the batch's net payout is already counted as
+// settled, so it must not also count against the ledger figure. Before the
+// fix every multi-day period reported a "gap" equal to the payouts in it.
+test("reconciliation over two days that include a paid batch reports gapFils === 0", async () => {
+  const { merchantId, rawKey } = await createApprovedMerchantWithApiKey("reconciliation-multiday", 250);
+  const txn = await authorize(rawKey, 10_000);
+  await capture(rawKey, txn.id);
+
+  const businessDate = todayBahrainDateString();
+  // The helper pays the batch at noon the next day, like the daemon would.
+  await closeAndPayoutBatch(merchantId, businessDate);
+  const twoDaysLater = addOneCalendarDay(addOneCalendarDay(businessDate));
+
+  const res = await app.inject({
+    method: "GET",
+    url: `/v1/settlement/reconciliation?from=${businessDate}&to=${twoDaysLater}`,
+    headers: authHeader(rawKey),
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  const report = res.json() as { gapFils: number; settlementNetPayoutFils: number; ledgerMerchantPayableNetFils: number };
+  assert.equal(report.settlementNetPayoutFils, 10_000 - Number(applyRateFils(toFils(10_000), 250)));
+  assert.equal(report.gapFils, 0, JSON.stringify(report));
+});
