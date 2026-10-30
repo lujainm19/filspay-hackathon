@@ -30,6 +30,28 @@ func RebuildMerchantBalance(ctx context.Context, db *pgxpool.Pool, merchantID uu
 	return money.Fils(balance), nil
 }
 
+// RebuildAndStoreMerchantBalance recomputes one merchant's balance from
+// ledger_entries and writes it to the cache, like RebuildAllBalances does for
+// every merchant. Backs `rebuild-balances --merchant=<id>`, which used to
+// call RebuildMerchantBalance (read only) and print "rebuilt=…" without ever
+// saving it, so an operator fixing one merchant's cache changed nothing.
+func RebuildAndStoreMerchantBalance(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID) (money.Fils, error) {
+	balance, err := RebuildMerchantBalance(ctx, db, merchantID)
+	if err != nil {
+		return 0, err
+	}
+	_, err = db.Exec(ctx, `
+		INSERT INTO merchant_balances (merchant_id, cached_payable_fils, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (merchant_id) DO UPDATE
+		  SET cached_payable_fils = $2, updated_at = now()
+	`, merchantID, int64(balance))
+	if err != nil {
+		return 0, fmt.Errorf("ledger: RebuildAndStoreMerchantBalance(%s): %w", merchantID, err)
+	}
+	return balance, nil
+}
+
 // RebuildDiff is the before/after state for one merchant, printed by the
 // rebuild-balances CLI subcommand so an operator sees exactly what
 // changed.
