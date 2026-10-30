@@ -18,6 +18,23 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
   // here.
   // see incident 2026-05-14 — readyz flapping took the LB out. fixed by making it boot-only — MK
   // am: wasnt 05-14 the db failover one? or the paylink one. too many incidents on that date
+  // GET /healthz/db — a *live* database probe (RUNBOOK: "a green /readyz says
+  // nothing about the database right now"). Used by the container
+  // healthcheck so an API that has lost its database is restarted instead of
+  // silently failing every request. 2 s statement budget.
+  app.get("/healthz/db", async (_req, reply) => {
+    try {
+      await Promise.race([
+        app.db.query("SELECT 1"),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("db probe timeout")), 2_000)),
+      ]);
+      return { status: "ok" };
+    } catch {
+      reply.code(503);
+      return { status: "db_unreachable" };
+    }
+  });
+
   app.get("/readyz", async (_req, reply) => {
     if (!isReady()) {
       reply.code(503);

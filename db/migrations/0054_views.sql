@@ -16,10 +16,11 @@ SELECT te.id AS event_id,
        t.merchant_id
   FROM transaction_events te
   JOIN transactions t ON t.id = te.transaction_id
- WHERE te.event_type = 'captured'
-   AND NOT EXISTS (
-     SELECT 1 FROM settlement_batch_events sbe WHERE sbe.transaction_event_id = te.id
-   );
+ WHERE te.event_type IN ('captured', 'partially_captured')
+   -- Batch membership is transaction_events.settlement_batch_id (0023); the
+   -- settlement_batch_events table this used to reference never existed, so
+   -- the migration failed on every fresh database.
+   AND te.settlement_batch_id IS NULL;
 
 CREATE OR REPLACE VIEW v_active_api_keys AS
 SELECT ak.id,

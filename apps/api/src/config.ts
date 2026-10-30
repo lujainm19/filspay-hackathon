@@ -13,6 +13,11 @@ export interface Config {
   databaseUrl: string;
 
   pgPoolMax: number;
+  /** Load shedding: answer 503 when more than this many requests are already
+   *  queued waiting for a database connection. */
+  maxPoolWaiters: number;
+  /** Load shedding: hard cap on concurrently handled requests. */
+  maxInFlightRequests: number;
   pgPoolMin: number;
   pgPoolIdleTimeoutMs: number;
   pgPoolConnectionTimeoutMs: number;
@@ -150,7 +155,7 @@ function parseBoolEnv(value: string | undefined, fallback: boolean): boolean {
   return value === "true" || value === "1";
 }
 
-const DEV_FALLBACK_WEBHOOK_KEY_B64 = "dGVzdC1rZXktZm9yLWRldi1vbmx5LW5vdC1mb3ItcHJvZA==";
+const DEV_FALLBACK_WEBHOOK_KEY_B64 = "Zmlsc3BheS1kZXYtb25seS13ZWJob29rLWtleS0zMmI=";
 
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
@@ -199,7 +204,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     port: parseIntEnv(env.PORT, 3000),
     databaseUrl,
 
-    pgPoolMax: parseIntEnv(env.PG_POOL_MAX, 5),
+    pgPoolMax: parseIntEnv(env.PG_POOL_MAX, 10),
+    maxPoolWaiters: parseIntEnv(env.MAX_POOL_WAITERS, 40),
+    maxInFlightRequests: parseIntEnv(env.MAX_IN_FLIGHT_REQUESTS, 200),
     pgPoolMin: parseIntEnv(env.PG_POOL_MIN, 0),
     pgPoolIdleTimeoutMs: parseIntEnv(env.PG_POOL_IDLE_TIMEOUT_MS, 30_000),
     pgPoolConnectionTimeoutMs: parseIntEnv(env.PG_POOL_CONNECTION_TIMEOUT_MS, 5_000),
@@ -209,7 +216,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     otpTtlMinutes: parseIntEnv(env.OTP_TTL_MINUTES, 5),
     otpCodeLength: parseIntEnv(env.OTP_CODE_LENGTH, 6),
     otpMaxAttempts: parseIntEnv(env.OTP_MAX_ATTEMPTS, 5),
-    otpDevExpose: parseBoolEnv(env.OTP_DEV_EXPOSE, nodeEnv !== "production"),
+    // Off unless explicitly requested, and never in production. It used to
+    // default ON whenever NODE_ENV wasn't "production" — and compose never
+    // set NODE_ENV — so the hosted API returned the OTP in the login response.
+    otpDevExpose: nodeEnv !== "production" && parseBoolEnv(env.OTP_DEV_EXPOSE, false),
 
     argon2MemoryKib: parseIntEnv(env.ARGON2_MEMORY_KIB, 19_456),
     argon2TimeCost: parseIntEnv(env.ARGON2_TIME_COST, 2),
@@ -256,6 +266,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     webhookRequestTimeoutMs: parseIntEnv(env.WEBHOOK_REQUEST_TIMEOUT_MS, 10_000),
 
     acquirerCallbackSigningSecret,
-    acquirerCallbackRequireSignature: parseBoolEnv(env.ACQUIRER_CALLBACK_REQUIRE_SIGNATURE, false),
+    // In production an unsigned callback is never accepted: this is a public
+    // route and "the acquirer signature is the only auth". The default used
+    // to be false everywhere, so anyone could POST fraud-review outcomes.
+    acquirerCallbackRequireSignature:
+      nodeEnv === "production" ? true : parseBoolEnv(env.ACQUIRER_CALLBACK_REQUIRE_SIGNATURE, false),
   };
 }

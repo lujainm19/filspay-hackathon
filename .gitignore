@@ -6,3 +6,7 @@ dist/
 npm-debug.log*
 .DS_Store
 .claude/
+# S20: any env file holds secrets — never track them (only *.example)
+.env*
+ops/.env*
+!**/.env.example
