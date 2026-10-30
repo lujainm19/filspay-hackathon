@@ -1,7 +1,7 @@
 import type { Pool } from "pg";
 import { insertAdminAuditLog } from "../adminAudit/log.js";
 import { withTransaction } from "../db/withTransaction.js";
-import { ConflictError, NotFoundError } from "../lib/errors.js";
+import { BadRequestError, ConflictError, NotFoundError } from "../lib/errors.js";
 import { insertReplayDeliveryRow } from "./replay.js";
 
 export interface ArchivedDeliveryEntry {
@@ -25,6 +25,9 @@ export interface CreateArchiveResult {
  * team, or a future auditor, needs the *complete* record for the range they
  * were told the archive covers).
  */
+/** At most this many deliveries go into one archive (a few MB of JSON). */
+export const MAX_ARCHIVE_DELIVERIES = 5_000;
+
 export async function createWebhookDeliveryArchive(
   pool: Pool,
   input: { merchantId: string; endpointId: string; adminUserId: string; from: Date; to: Date },
@@ -48,9 +51,22 @@ export async function createWebhookDeliveryArchive(
       `SELECT id, outbox_event_id, event_type, payload, created_at
          FROM webhook_deliveries
         WHERE endpoint_id = $1 AND created_at >= $2 AND created_at < $3
-        ORDER BY created_at ASC`,
-      [input.endpointId, input.from, input.to],
+        ORDER BY created_at ASC
+        LIMIT $4`,
+      [input.endpointId, input.from, input.to, MAX_ARCHIVE_DELIVERIES + 1],
     );
+    // R5 fix: what was wrong — any date range was read in one query and built
+    // into one big JSON string (ADMIN.md promised "pages of 1000"; there were
+    // none). Why it matters — a year of deliveries for a busy endpoint is
+    // hundreds of MB inside a 512 MB API. What it broke — an archive request
+    // could OOM the API. Now a range that's too big is refused with a clear
+    // message, so support archives it in smaller pieces.
+    if (rows.rows.length > MAX_ARCHIVE_DELIVERIES) {
+      throw new BadRequestError(
+        "archive_range_too_large",
+        `more than ${MAX_ARCHIVE_DELIVERIES} deliveries in this range; archive a shorter period`,
+      );
+    }
 
     const entries: ArchivedDeliveryEntry[] = rows.rows.map((r) => ({
       deliveryId: r.id,
