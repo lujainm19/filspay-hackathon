@@ -2,6 +2,7 @@ import type { Pool } from "pg";
 import type { Config } from "../config.js";
 import { decodeEncryptionKey, decryptSecret } from "./secretCrypto.js";
 import { signPayload } from "./sign.js";
+import { canonicalJson } from "../payments/idempotency.js";
 import { WEBHOOK_SIGNATURE_HEADER } from "./headers.js";
 import type { WebhookTransport } from "./transport.js";
 import { NotFoundError } from "../lib/errors.js";
@@ -59,7 +60,13 @@ export async function sendTestWebhookEvent(
   const response = await transport({
     url: row.url,
     headers: { [WEBHOOK_SIGNATURE_HEADER]: signature, "Content-Type": "application/json" },
-    body: JSON.stringify(testPayload),
+    // W1 fix (FP-240): what was wrong — we signed canonicalJson(payload) (keys
+    // sorted) but sent JSON.stringify(payload) (keys in whatever order jsonb
+    // hands them back). Why it matters — receivers verify the HMAC over the
+    // exact bytes they receive. What it broke — signatures didn't match the
+    // body, so merchants couldn't verify us (and RUNBOOK told them to re-sort
+    // keys on their side). Now the body IS the string we signed.
+    body: canonicalJson(testPayload),
     timeoutMs: config.webhookRequestTimeoutMs,
   });
 

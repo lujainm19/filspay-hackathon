@@ -43,10 +43,16 @@ export async function insertReplayDeliveryRow(
   client: PoolClient,
   original: OriginalDelivery,
 ): Promise<ReplayResult> {
-  // MK: new id per replay on purpose, receivers dedupe on the original id in the body
-  // FH: ARCH §5 says Webhook-Delivery-Id is stable across retries and replays — this mints a new one?
-  const newDeliveryEventId = randomUUID();
-  const replayPayload = { ...original.payload, id: newDeliveryEventId };
+  // W2 fix: what was wrong — every replay minted a brand-new delivery id and
+  // wrote it into the body. Why it matters — ARCHITECTURE §5 and migration 0022
+  // both say Webhook-Delivery-Id stays the same across retries AND replays,
+  // because that's the id receivers dedupe on. What it broke — a replayed
+  // settlement.paid (or a whole replayed batch) looked brand new to the
+  // merchant, so it was processed twice. We now reuse the original id, which
+  // the envelope already carries as `id`.
+  const originalId = original.payload.id;
+  const deliveryEventId = typeof originalId === "string" && originalId !== "" ? originalId : randomUUID();
+  const replayPayload = { ...original.payload, id: deliveryEventId };
 
   const insertResult = await client.query<{ id: string; status: string }>(
     `INSERT INTO webhook_deliveries
@@ -57,7 +63,7 @@ export async function insertReplayDeliveryRow(
       original.endpointId,
       original.outboxEventId,
       original.eventType,
-      newDeliveryEventId,
+      deliveryEventId,
       JSON.stringify(replayPayload),
       original.id,
     ],

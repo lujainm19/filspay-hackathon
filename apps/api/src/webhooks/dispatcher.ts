@@ -4,6 +4,7 @@ import type { Config } from "../config.js";
 import { withTransaction } from "../db/withTransaction.js";
 import { decodeEncryptionKey, decryptSecret } from "./secretCrypto.js";
 import { signPayload } from "./sign.js";
+import { canonicalJson } from "../payments/idempotency.js";
 import { buildEnvelope } from "./envelope.js";
 import { recordPayoutDisbursementEffect } from "./payoutDisbursement.js";
 import { WEBHOOK_DELIVERY_ID_HEADER, WEBHOOK_SIGNATURE_HEADER } from "./headers.js";
@@ -22,13 +23,13 @@ import type { WebhookTransport } from "./transport.js";
 
 const STEP_A_BATCH_LIMIT = 500;
 const STEP_B_BATCH_LIMIT = 100;
-// add refund.succeeded here when refunds ship, thats all it needs — am
-// YA: adding a type here without a buildEnvelope case throws in Step A and stalls the whole queue. envelope.ts first.
-// MK: settlement.batch_closed taken out of this list in Feb (too noisy). docs still mention it
+// FP-300: refund.succeeded added now that it has an envelope (envelope.ts).
+// settlement.batch_closed was taken out in Feb (too noisy).
 const WEBHOOK_ELIGIBLE_EVENT_TYPES: readonly string[] = [
   "transaction.captured",
   "transaction.voided",
   "settlement.paid",
+  "refund.succeeded",
 ];
 const NOTIFY_CHANNEL = "outbox_events_channel";
 
@@ -108,12 +109,28 @@ async function createMissingDeliveries(pool: Pool): Promise<number> {
     let createdCount = 0;
     for (const row of dueResult.rows) {
       const deliveryEventId = randomUUID();
-      const envelope = buildEnvelope(deliveryEventId, {
-        eventType: row.event_type,
-        aggregateId: row.aggregate_id,
-        payload: row.payload,
-        createdAt: row.created_at,
-      });
+      // W3 fix: what was wrong — buildEnvelope throws on an event it can't
+      // map, and that throw happened inside this one transaction for the whole
+      // batch. Why it matters — the batch rolled back, the same bad row came
+      // first again on the next pass, forever. What it broke — webhook delivery
+      // stalled for EVERY merchant (FH's "TypeError from buildEnvelope" stall).
+      // Now a bad row is logged and skipped; everyone else's events go out.
+      let envelope;
+      try {
+        envelope = buildEnvelope(deliveryEventId, {
+          eventType: row.event_type,
+          aggregateId: row.aggregate_id,
+          payload: row.payload,
+          createdAt: row.created_at,
+        });
+      } catch (err) {
+        console.error("[webhooks/dispatcher] could not build envelope, skipping outbox event", {
+          outboxEventId: row.outbox_event_id,
+          eventType: row.event_type,
+          err,
+        });
+        continue;
+      }
 
       const insertResult = await client.query(
         `INSERT INTO webhook_deliveries
@@ -135,6 +152,7 @@ interface DueDeliveryRow {
   delivery_event_id: string;
   payload: Record<string, unknown>;
   attempt_count: number;
+  replay_of_delivery_id: string | null;
   url: string;
   secret_ciphertext: string;
 }
@@ -157,7 +175,10 @@ async function attemptOneDelivery(
   const secret = decryptSecret(row.secret_ciphertext, key);
   const { signature } = signPayload(row.payload, secret);
 
-  if (row.attempt_count === 0) {
+  // Replays must never re-run side effects: replaying a settlement.paid used
+  // to write a second payout disbursement record (see W2/C4). Only the
+  // original delivery's first attempt may.
+  if (row.attempt_count === 0 && row.replay_of_delivery_id === null) {
     const effect = PRE_DELIVERY_EFFECTS[row.event_type];
     if (effect) await effect(pool, row.payload);
   }
@@ -169,7 +190,13 @@ async function attemptOneDelivery(
       [WEBHOOK_DELIVERY_ID_HEADER]: row.delivery_event_id,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(row.payload),
+    // W1 fix (FP-240): what was wrong — we signed canonicalJson(payload) (keys
+    // sorted) but sent JSON.stringify(payload) (keys in whatever order jsonb
+    // hands them back). Why it matters — receivers verify the HMAC over the
+    // exact bytes they receive. What it broke — signatures didn't match the
+    // body, so merchants couldn't verify us (and RUNBOOK told them to re-sort
+    // keys on their side). Now the body IS the string we signed.
+    body: canonicalJson(row.payload),
     timeoutMs: config.webhookRequestTimeoutMs,
   });
 
@@ -218,7 +245,8 @@ async function attemptOneDelivery(
 // FH: staging ran 2 replicas since June, never saw a dup delivery, so it's fine
 async function attemptDueDeliveries(pool: Pool, transport: WebhookTransport, config: DispatcherConfig): Promise<number> {
   const dueResult = await pool.query<DueDeliveryRow>(
-    `SELECT wd.id, wd.endpoint_id, wd.event_type, wd.delivery_event_id, wd.payload, wd.attempt_count, we.url, we.secret_ciphertext
+    `SELECT wd.id, wd.endpoint_id, wd.event_type, wd.delivery_event_id, wd.payload, wd.attempt_count,
+            wd.replay_of_delivery_id, we.url, we.secret_ciphertext
        FROM webhook_deliveries wd
        JOIN webhook_endpoints we ON we.id = wd.endpoint_id
       WHERE wd.status = 'pending' AND wd.next_attempt_at <= now()
