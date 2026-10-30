@@ -69,7 +69,10 @@ services:
         condition: service_healthy
     restart: "no"
 
-  # Demo data. Truncates fixture tables — only runs when asked for:
+  # Demo data. TRUNCATE ... CASCADE wipes merchants and everything that
+  # references them (not just "fixture tables"). Only runs when asked for,
+  # and db/seed/index.ts refuses a database holding non-seed users unless
+  # SEED_CONFIRM_WIPE=<database name> is set (R9):
   #   docker compose -f ops/docker-compose.yml --profile seed run --rm seed
   seed:
     profiles: ["seed"]

@@ -1,20 +1,45 @@
 #!/usr/bin/env -S npx tsx
 /**
- * One-off March 2026 reconciliation sweep. Finance wants the scheme
- * rounding residue (the gap between what gets journaled at capture and
- * what the scheme export can actually carry at 2 decimal places) written
- * off for March before the books close on it. Run manually, once — see
- * scripts/out/reconcile-2026-03.log for the last real run's output.
+ * March 2026 scheme rounding residue sweep (FP-187 / finance memo).
  *
- * Usage: DATABASE_URL=postgres://... npx tsx scripts/reconcile_march.ts
+ * Rewritten during the handover review. The old script:
+ *   - used a UTC calendar month. The handover is explicit ("must use the
+ *     Bahrain month, not a UTC month"): the first three Bahrain hours of
+ *     March were left out and the first three of April pulled in;
+ *   - computed residue from transactions.captured_fils (a running total,
+ *     dated by authorization time), not from what was actually exported to
+ *     the scheme;
+ *   - debited merchant_payable — charging the *merchant* for the platform's
+ *     rounding — instead of the ADR-0002 accounts;
+ *   - had no duplicate guard ("someone ran it twice on staging and the gap
+ *     doubled"; the RUNBOOK's claim that it checks for an existing posting
+ *     was false), and wrote to the ledger on every run.
+ *
+ * Now: residue = Σ(exported line gross − exported amount_fils) for batches
+ * whose business date is in March 2026; posted per merchant as
+ * debit scheme_rounding_residue / credit card_scheme_clearing; refuses to post
+ * if a sweep for the month already exists; dry run unless --apply.
+ *
+ *   DATABASE_URL=postgres://... npx tsx scripts/reconcile_march.ts          # dry run
+ *   DATABASE_URL=postgres://... npx tsx scripts/reconcile_march.ts --apply  # post
+ *
+ * From April 2026 onwards CloseBatch journals residue itself, so this is
+ * only for March.
  */
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { Client } from "pg";
 import { formatBhd, toFils } from "@filspay/money";
 
+/** Asia/Bahrain (UTC+3, no DST) calendar month as UTC instants. */
 export function monthBounds(year: number, month: number): { start: Date; end: Date } {
-  return { start: new Date(Date.UTC(year, month - 1, 1)), end: new Date(Date.UTC(year, month, 1)) };
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const nextYear = month === 12 ? year + 1 : year;
+  const nextMonth = month === 12 ? 1 : month + 1;
+  return {
+    start: new Date(`${year}-${pad(month)}-01T00:00:00+03:00`),
+    end: new Date(`${nextYear}-${pad(nextMonth)}-01T00:00:00+03:00`),
+  };
 }
 
 export interface ResidueRow {
@@ -22,9 +47,8 @@ export interface ResidueRow {
   capturedFils: number;
 }
 
-/** The fils truncated away when a captured amount is quantized down to the
- *  scheme export's 2-decimal-place granularity. */
-// MK: % 10 on a non-negative int. correct.
+/** The fils truncated away when an amount is quantized down to the scheme's
+ *  2-decimal granularity. */
 export function computeResidueFils(capturedFils: number): number {
   return capturedFils % 10;
 }
@@ -35,50 +59,38 @@ interface MerchantResidue {
   residueFils: number;
 }
 
-async function fetchResidueRows(client: Client, year: number, month: number): Promise<ResidueRow[]> {
-  const { start, end } = monthBounds(year, month);
-  const result = await client.query<{ merchant_id: string; captured_fils: string }>(
-    `SELECT merchant_id, captured_fils
-       FROM transactions
-      WHERE captured_fils > 0
-        AND captured_fils % 10 <> 0
-        AND occurred_at >= $1 AND occurred_at < $2
-      ORDER BY merchant_id, occurred_at`,
-    [start.toISOString(), end.toISOString()],
-  );
-  return result.rows.map((r) => ({ merchantId: r.merchant_id, capturedFils: Number(r.captured_fils) }));
-}
+const SWEEP_DESCRIPTION = "scheme rounding residue sweep 2026-03";
 
-/**
- * One correction group per merchant. lineCount is the number of transactions
- * with a non-zero residue, not the number of scheme lines.
- */
-function groupByMerchant(rows: ResidueRow[]): MerchantResidue[] {
-  const byMerchant = new Map<string, MerchantResidue>();
-  for (const row of rows) {
-    const residue = computeResidueFils(row.capturedFils);
-    const existing = byMerchant.get(row.merchantId);
-    if (existing) {
-      existing.lineCount += 1;
-      existing.residueFils += residue;
-    } else {
-      byMerchant.set(row.merchantId, { merchantId: row.merchantId, lineCount: 1, residueFils: residue });
-    }
-  }
-  return [...byMerchant.values()];
-}
-
-// am: re-running is safe, entry_group_id dedupes it
-async function postResidueCorrection(client: Client, merchant: MerchantResidue, now: Date): Promise<void> {
-  if (merchant.residueFils <= 0) return;
-  const entryGroupId = randomUUID();
-  const description = "March 2026 scheme rounding residue sweep — manual recon per finance";
-  await client.query(
-    `INSERT INTO ledger_entries (entry_group_id, merchant_id, account_id, direction, amount_fils, occurred_at, description)
-     VALUES ($1, $2, 'merchant_payable', 'debit', $3, $4, $5),
-            ($1, $2, 'scheme_rounding_residue', 'credit', $3, $4, $5)`,
-    [entryGroupId, merchant.merchantId, merchant.residueFils, now.toISOString(), description],
+async function fetchMerchantResidues(client: Client, year: number, month: number): Promise<MerchantResidue[]> {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const first = `${year}-${pad(month)}-01`;
+  // batch_date is the Bahrain business date, so a date range is exact.
+  const result = await client.query<{ merchant_id: string; line_count: string; residue_fils: string }>(
+    `WITH line_gross AS (
+       SELECT sb.merchant_id, sel.id, sel.amount_fils,
+              (SELECT COALESCE(SUM(te.amount_fils), 0)
+                 FROM transaction_events te
+                WHERE te.settlement_batch_id = sel.settlement_batch_id
+                  AND te.transaction_id = sel.transaction_id
+                  AND te.event_type IN ('captured', 'partially_captured')) AS gross_fils
+         FROM scheme_export_lines sel
+         JOIN settlement_batches sb ON sb.id = sel.settlement_batch_id
+        WHERE sb.batch_date >= $1::date AND sb.batch_date < ($1::date + interval '1 month')
+     )
+     SELECT merchant_id,
+            COUNT(*) FILTER (WHERE gross_fils - amount_fils > 0)::text AS line_count,
+            COALESCE(SUM(GREATEST(gross_fils - amount_fils, 0)), 0)::text AS residue_fils
+       FROM line_gross
+      GROUP BY merchant_id
+     HAVING SUM(GREATEST(gross_fils - amount_fils, 0)) > 0
+      ORDER BY merchant_id`,
+    [first],
   );
+  return result.rows.map((r) => ({
+    merchantId: r.merchant_id,
+    lineCount: Number(r.line_count),
+    residueFils: Number(r.residue_fils),
+  }));
 }
 
 async function main(): Promise<void> {
@@ -86,42 +98,50 @@ async function main(): Promise<void> {
   if (!databaseUrl) {
     throw new Error("reconcile_march: DATABASE_URL environment variable is not set");
   }
-
+  const apply = process.argv.includes("--apply");
   const client = new Client({ connectionString: databaseUrl });
   await client.connect();
-  // FH: the log says 'run at ...+03:00' but toISOString is always Z?? MK: different node version
-  const now = new Date();
 
   try {
-    const rows = await fetchResidueRows(client, 2026, 3);
-    const merchantResidues = groupByMerchant(rows);
-    const totalResidueFils = merchantResidues.reduce((sum, m) => sum + m.residueFils, 0);
-
     const { start, end } = monthBounds(2026, 3);
-    console.log("=== March 2026 reconciliation sweep ===");
-    console.log(`run at: ${now.toISOString()}`);
-    console.log(`window: ${start.toISOString().slice(0, 10)} .. ${end.toISOString().slice(0, 10)}`);
-    console.log("");
+    console.log("=== March 2026 scheme residue sweep ===");
+    console.log(`mode:   ${apply ? "APPLY" : "dry run (pass --apply to post)"}`);
+    console.log(`window: ${start.toISOString()} .. ${end.toISOString()} (Asia/Bahrain month)`);
 
     await client.query("BEGIN");
-    try {
-      for (const merchant of merchantResidues) {
-        await postResidueCorrection(client, merchant, now);
-        console.log(
-          `merchant ${merchant.merchantId}: ${merchant.lineCount} line(s), residue ${formatBhd(toFils(merchant.residueFils))} BD (${merchant.residueFils} fils)`,
-        );
-      }
-      await client.query("COMMIT");
-    } catch (err) {
+    // Serialize concurrent runs, then refuse a second posting.
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [SWEEP_DESCRIPTION]);
+    const existing = await client.query(`SELECT 1 FROM ledger_entries WHERE description = $1 LIMIT 1`, [
+      SWEEP_DESCRIPTION,
+    ]);
+    if ((existing.rowCount ?? 0) > 0) {
       await client.query("ROLLBACK");
-      throw err;
+      console.log("already posted for March 2026 — nothing to do (refusing to post twice)");
+      return;
     }
 
+    const merchants = await fetchMerchantResidues(client, 2026, 3);
+    let total = 0;
+    for (const m of merchants) {
+      total += m.residueFils;
+      console.log(`merchant ${m.merchantId}: ${m.lineCount} line(s), residue ${formatBhd(toFils(m.residueFils))} BD`);
+      if (apply) {
+        const group = randomUUID();
+        await client.query(
+          `INSERT INTO ledger_entries (entry_group_id, merchant_id, account_id, direction, amount_fils, occurred_at, description)
+           VALUES ($1, $2, 'scheme_rounding_residue', 'debit',  $3, $4, $5),
+                  ($1, $2, 'card_scheme_clearing',    'credit', $3, $4, $5)`,
+          // Dated inside March (last instant of the Bahrain month).
+          [group, m.merchantId, m.residueFils, new Date(end.getTime() - 1).toISOString(), SWEEP_DESCRIPTION],
+        );
+      }
+    }
+    await client.query(apply ? "COMMIT" : "ROLLBACK");
     console.log("---");
-    console.log(`total lines matched: ${rows.length}`);
-    console.log(`total residue swept: ${formatBhd(toFils(totalResidueFils))} BD (${totalResidueFils} fils)`);
-    console.log("");
-    console.log("reconciliation applied successfully");
+    console.log(`total residue: ${formatBhd(toFils(total))} BD (${total} fils) ${apply ? "posted" : "NOT posted (dry run)"}`);
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
   } finally {
     await client.end();
   }
