@@ -152,6 +152,8 @@ export function TransactionDetailPage() {
         <dd>{bhd(txn.amountFils)}</dd>
         <dt>Captured amount</dt>
         <dd>{bhd(txn.capturedFils)}</dd>
+        <dt>Refunded amount</dt>
+        <dd>{bhd(txn.refundedFils)}</dd>
         <dt>Currency</dt>
         <dd>{txn.currency}</dd>
         <dt>Reference</dt>
@@ -166,10 +168,9 @@ export function TransactionDetailPage() {
         <dd>{dateTime(txn.createdAt)}</dd>
       </dl>
 
-      {/* Capture, void and refund are hidden from `support`. A hidden button
-          is not a security boundary: the API must enforce owner/finance on
-          capture/void/refund (Lujain's API branch). */}
-      <RefundDrawer txn={txn} onRefunded={load} />
+      {/* Capture, void and refund are hidden from `support` as a convenience.
+          The API now enforces the same owner/finance rule itself (S14), so
+          the hidden button is no longer the only thing stopping them. */}
       <RequireRole allow={["owner", "finance"]}>
         {capturable || voidable ? (
           <div className="dash-actions">
@@ -220,6 +221,9 @@ export function TransactionDetailPage() {
           </div>
         ) : null}
       </RequireRole>
+
+      {/* FP-300: refunds (the drawer checks the role and what's refundable). */}
+      <RefundDrawer txn={txn} onRefunded={load} />
 
       <h2>Event timeline</h2>
       <table className="dash-table">

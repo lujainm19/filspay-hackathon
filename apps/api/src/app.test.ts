@@ -108,7 +108,10 @@ async function signupLoginAndVerify(emailPrefix: string) {
   });
   assert.equal(verifyRes.statusCode, 200, verifyRes.body);
 
-  return { merchantId, email, password, cookie };
+  // S16: verify hands out a fresh cookie and the pre-OTP one stops working,
+  // so keep the new one, exactly like a browser would.
+  const authedCookie = parseCookie(verifyRes.headers["set-cookie"]);
+  return { merchantId, email, password, cookie: authedCookie };
 }
 
 function buildMultipart(

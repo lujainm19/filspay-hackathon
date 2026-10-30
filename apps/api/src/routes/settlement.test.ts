@@ -480,3 +480,47 @@ test("GET /v1/settlement/reconciliation succeeds for a 'finance' session role", 
   });
   assert.equal(res.statusCode, 200, res.body);
 });
+
+test("M11: a transaction captured in two parts is counted once, at its real total", async () => {
+  const { rawKey } = await createApprovedMerchantWithApiKey("summary-multi-capture", 250);
+  const txn = await authorize(rawKey, 10_000);
+  await capture(rawKey, txn.id, { amountFils: 4_000 });
+  await capture(rawKey, txn.id, { amountFils: 6_000 });
+
+  const businessDate = todayBahrainDateString();
+  const res = await app.inject({
+    method: "GET",
+    url: `/v1/settlement/summary?from=${businessDate}&to=${addOneCalendarDay(businessDate)}`,
+    headers: authHeader(rawKey),
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  // The old query summed the running total once per capture event: 10 000 × 2.
+  assert.deepEqual(
+    { count: res.json().transactionCount, total: res.json().totalCapturedFils },
+    { count: 1, total: 10_000 },
+  );
+});
+
+test("M12: a discounted merchant with an unbatched capture and a refund still reconciles to a zero gap", async () => {
+  const { merchantId, rawKey } = await createApprovedMerchantWithApiKey("reconciliation-discount-refund", 275);
+  await pool.query(`UPDATE merchants SET negotiated_discount_bps = 75 WHERE id = $1`, [merchantId]);
+  const txn = await authorize(rawKey, 4_741); // an amount whose fee doesn't round cleanly
+  await capture(rawKey, txn.id);
+  const refundRes = await app.inject({
+    method: "POST",
+    url: `/v1/merchants/${merchantId}/refunds`,
+    headers: { ...authHeader(rawKey), "idempotency-key": randomUUID() },
+    payload: { transactionId: txn.id, amountFils: 1_000 },
+  });
+  assert.equal(refundRes.statusCode, 200, refundRes.body);
+
+  const businessDate = todayBahrainDateString();
+  const res = await app.inject({
+    method: "GET",
+    url: `/v1/settlement/reconciliation?from=${businessDate}&to=${addOneCalendarDay(businessDate)}`,
+    headers: authHeader(rawKey),
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  assert.equal(res.json().gapFils, 0, res.body);
+  assert.equal(res.json().explained, true);
+});

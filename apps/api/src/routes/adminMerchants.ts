@@ -208,7 +208,8 @@ export async function adminMerchantRoutes(app: FastifyInstance): Promise<void> {
    * money moves directly, so it is not gated to finance.
    */
   app.post<{ Params: EndpointParams; Body: ReplayBatchBody }>(
-    // YA: deduped receiver-side by the stable Webhook-Delivery-Id. replay keeps the original id. correct
+    // Receivers dedupe on the stable Webhook-Delivery-Id; since the W2 fix in
+    // webhooks/replay.ts, a replay really does keep the original id.
     "/:id/webhook-endpoints/:endpointId/replay-batch",
     { preHandler: [requireAdminSession] },
     async (request, reply) => {

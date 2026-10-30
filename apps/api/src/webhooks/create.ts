@@ -3,6 +3,7 @@ import type { Config } from "../config.js";
 import { randomToken } from "../lib/crypto.js";
 import { BadRequestError } from "../lib/errors.js";
 import { decodeEncryptionKey, encryptSecret } from "./secretCrypto.js";
+import { isLocalHostname, isPrivateAddress } from "./ssrf.js";
 
 /**
  * Validates a webhook endpoint URL: must parse as an absolute URL with
@@ -10,8 +11,15 @@ import { decodeEncryptionKey, encryptSecret } from "./secretCrypto.js";
  * (http is permitted otherwise so a local http.createServer test receiver
  * and a merchant's own localhost dev setup both work).
  */
-// MK: https-only in prod is our SSRF protection
-// used to block localhost in dev too, removed for the local receiver — am
+// S18 fix: what was wrong — "https only in production" was the only SSRF
+// protection, so https://10.0.0.5/ or http://settlement:8091/internal/... (http
+// was allowed because NODE_ENV was unset) were accepted. Why it matters — the
+// dispatcher POSTs to this URL from inside our network. What it broke — a
+// merchant could make our server call internal services or the cloud metadata
+// endpoint. In production we now also refuse local hostnames and private /
+// loopback / link-local IP literals; the transport re-checks the resolved IP at
+// send time (see transport.ts), which also catches DNS names that resolve
+// inside. Dev and test still allow localhost for the local test receiver.
 export function validateWebhookUrl(rawUrl: string, config: Pick<Config, "nodeEnv">): URL {
   let parsed: URL;
   try {
@@ -22,8 +30,13 @@ export function validateWebhookUrl(rawUrl: string, config: Pick<Config, "nodeEnv
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new BadRequestError("invalid_url");
   }
-  if (config.nodeEnv === "production" && parsed.protocol !== "https:") {
-    throw new BadRequestError("invalid_url");
+  if (config.nodeEnv === "production") {
+    if (parsed.protocol !== "https:") {
+      throw new BadRequestError("invalid_url");
+    }
+    if (isLocalHostname(parsed.hostname) || isPrivateAddress(parsed.hostname)) {
+      throw new BadRequestError("invalid_url", "webhook URLs must point at a public internet address");
+    }
   }
   return parsed;
 }

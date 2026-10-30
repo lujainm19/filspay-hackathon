@@ -44,7 +44,10 @@ export function RefundDrawer({ txn, onRefunded }: RefundDrawerProps) {
   const [done, setDone] = useState<string | null>(null);
 
   const merchantId = me?.merchant.id;
-  if (!REFUNDABLE.has(txn.status)) return null;
+  // What's left to give back: captured minus what earlier refunds already
+  // returned (the API checks the same thing; M14). Nothing left = no button.
+  const refundableFils = txn.capturedFils - txn.refundedFils;
+  if (!REFUNDABLE.has(txn.status) || refundableFils <= 0) return null;
 
   async function handleRefund(event: React.FormEvent): Promise<void> {
     event.preventDefault();
@@ -112,7 +115,9 @@ export function RefundDrawer({ txn, onRefunded }: RefundDrawerProps) {
               Reason (optional)
               <input type="text" maxLength={200} value={reason} onChange={(e) => setReason(e.target.value)} />
             </label>
-            <p className="dash-muted">Captured: {bhd(txn.capturedFils)}</p>
+            <p className="dash-muted">
+              Captured: {bhd(txn.capturedFils)} · Still refundable: {bhd(refundableFils)}
+            </p>
             <button type="submit" className="dash-button" disabled={submitting}>
               {submitting ? "Refunding…" : "Refund"}
             </button>

@@ -59,7 +59,9 @@ function callbackBody(transactionId: string, callbackId: string) {
   };
 }
 
-function signatureHeader(body: unknown, secret = ACQUIRER_SECRET, timestamp = 1_757_930_000): string {
+// S11: signatures now have to be fresh (within 5 minutes), so sign with "now"
+// instead of a fixed 2025 timestamp.
+function signatureHeader(body: unknown, secret = ACQUIRER_SECRET, timestamp = Math.floor(Date.now() / 1000)): string {
   const signature = createHmac("sha256", secret).update(`${timestamp}.${JSON.stringify(body)}`).digest("hex");
   return `t=${timestamp},v1=${signature}`;
 }
@@ -122,9 +124,9 @@ test("POST /v1/acquirer/callbacks rejects a tampered signature", async () => {
 // dev-mode behaviour (empty secret). prod rejects — MK
 // am: the test app config sets a secret though? line ~40
 test("POST /v1/acquirer/callbacks accepts a callback sent without a signature header", async () => {
-  // Documents current behavior for the acquirer sandbox's pre-signing
-  // tooling: with no header there is nothing to verify, so the callback is
-  // processed rather than rejected.
+  // Dev/test mode: signature checking is optional unless
+  // ACQUIRER_CALLBACK_REQUIRE_SIGNATURE is set, and it is always required in
+  // production (config.ts). The production behaviour is tested just below.
   const transactionId = await createTransaction();
   const callbackId = `acqcb_${randomUUID()}`;
 
@@ -134,9 +136,37 @@ test("POST /v1/acquirer/callbacks accepts a callback sent without a signature he
     payload: callbackBody(transactionId, callbackId),
   });
 
-  assert.equal(res.statusCode, 200);
-  assert.deepEqual(res.json(), { received: true });
+  assert.equal(res.statusCode, 200, res.body);
   assert.equal(await noteCount(callbackId), "1");
+});
+
+test("S11: when a signature is required (always in production) an unsigned callback is a 401 and records nothing", async () => {
+  // In production config.ts forces acquirerCallbackRequireSignature on.
+  const prod = loadConfig({
+    DATABASE_URL: databaseUrl,
+    NODE_ENV: "production",
+    WEBHOOK_SECRET_ENCRYPTION_KEY: "Y1ZTGTcYbe30GZJebys9w7T3OYZNKewuOH3SUCEdRQk=",
+    ACQUIRER_CALLBACK_SIGNING_SECRET: ACQUIRER_SECRET,
+    SETTLEMENT_INTERNAL_TOKEN: "test-only-settlement-token",
+    ACQUIRER_CALLBACK_REQUIRE_SIGNATURE: "false", // can't be switched off in production
+  });
+  assert.equal(prod.acquirerCallbackRequireSignature, true);
+
+  // Same route, with signatures required, without needing a full production setup.
+  const strictApp = buildApp({ ...config, acquirerCallbackRequireSignature: true }, pool);
+  try {
+    const transactionId = await createTransaction();
+    const callbackId = `acqcb_${randomUUID()}`;
+    const res = await strictApp.inject({
+      method: "POST",
+      url: "/v1/acquirer/callbacks",
+      payload: callbackBody(transactionId, callbackId),
+    });
+    assert.equal(res.statusCode, 401);
+    assert.equal(await noteCount(callbackId), "0");
+  } finally {
+    await strictApp.close();
+  }
 });
 
 test("POST /v1/acquirer/callbacks returns 404 for an unknown transaction id", async () => {
@@ -152,4 +182,32 @@ test("POST /v1/acquirer/callbacks returns 404 for an unknown transaction id", as
 
   assert.equal(res.statusCode, 404);
   assert.equal(res.json().error, "transaction_not_found");
+});
+
+test("C5 (FP-201): the acquirer re-sending the same callback stores one note, not two", async () => {
+  const transactionId = await createTransaction();
+  const callbackId = `acqcb_${randomUUID()}`;
+  const body = callbackBody(transactionId, callbackId);
+  for (let i = 0; i < 2; i++) {
+    const res = await app.inject({
+      method: "POST",
+      url: "/v1/acquirer/callbacks",
+      headers: { "acquirer-callback-signature": signatureHeader(body) },
+      payload: body,
+    });
+    assert.equal(res.statusCode, 200, res.body);
+  }
+  assert.equal(await noteCount(callbackId), "1");
+});
+
+test("an outcome outside cleared / confirmed_fraud is rejected with 400", async () => {
+  const transactionId = await createTransaction();
+  const body = { ...callbackBody(transactionId, `acqcb_${randomUUID()}`), outcome: "whatever" };
+  const res = await app.inject({
+    method: "POST",
+    url: "/v1/acquirer/callbacks",
+    headers: { "acquirer-callback-signature": signatureHeader(body) },
+    payload: body,
+  });
+  assert.equal(res.statusCode, 400, res.body);
 });

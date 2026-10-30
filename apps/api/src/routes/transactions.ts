@@ -1,12 +1,12 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { toFils } from "@filspay/money";
 import { requireApiKey } from "../apiKeys/verify.js";
-import { requireMerchantAuth, requireMerchantWriterActor } from "../auth/requireMerchantAuth.js";
+import { requireMerchantAuth, requireMerchantRole, requireMerchantWriterActor } from "../auth/requireMerchantAuth.js";
 import { authorizeTransaction, type AuthorizeInput } from "../payments/authorize.js";
 import { captureTransaction } from "../payments/capture.js";
-import { applyCaptureDiscountAdjustment } from "../payments/discountAdjustment.js";
 import { voidTransaction } from "../payments/void.js";
-import { buildTransactionsExportCsv } from "../transactions/exportCsv.js";
+import { Readable } from "node:stream";
+import { transactionsExportCsvLines } from "../transactions/exportCsv.js";
 import { getTransactionById, listTransactions } from "../transactions/query.js";
 import { listTransactionEvents } from "../transactions/events.js";
 import { BadRequestError, NotFoundError } from "../lib/errors.js";
@@ -88,11 +88,12 @@ export async function transactionRoutes(app: FastifyInstance): Promise<void> {
   );
 
   app.post<{ Params: TransactionIdParams; Body: CaptureBody }>(
-    // am: requireMerchantAuth lets impersonation through here too? an admin impersonating can capture
-    // MK: impersonation is read-only, enforced in requireMerchantAuth. fine
-    // MK: confirmed — ADMIN.md says grants are support-level read only
     "/:id/capture",
-    { preHandler: requireMerchantAuth },
+    // S14 fix: capture moves money but only checked "logged in", so a support
+    // user (or an admin viewing as the merchant) could capture. Same owner /
+    // finance rule as every other money-moving merchant route. API keys still
+    // pass (requireMerchantRole treats them as full merchant authority).
+    { preHandler: [requireMerchantAuth, requireMerchantRole("owner", "finance")] },
     async (request, reply) => {
       const idempotencyKey = getIdempotencyKey(request);
       const { amountFils } = request.body ?? {};
@@ -104,23 +105,16 @@ export async function transactionRoutes(app: FastifyInstance): Promise<void> {
         idempotencyKey,
         actor: requireMerchantWriterActor(request.merchantAuth!),
       });
-      // discount applied after capture commits, separate txn. on a replayed 200 this runs again
-      // but the count guard makes it a no-op — MK 2026-06
-      // am: and if this throws, the capture is committed but the discount never lands? retry = replay = ...
-      if (result.statusCode === 200) {
-        await applyCaptureDiscountAdjustment(app.db, {
-          merchantId: request.merchantAuth!.merchantId,
-          transactionId: request.params.id,
-        });
-      }
+      // M9: the negotiated discount is now part of the fee capture.ts
+      // computes, so there's no second "discount adjustment" step here.
       reply.code(result.statusCode).send(result.body);
     },
   );
 
   app.post<{ Params: TransactionIdParams }>(
-    // TODO(FH): role check? finance role users shouldn't void. ask MK
     "/:id/void",
-    { preHandler: requireMerchantAuth },
+    // S14 fix: same as capture — void had no role check at all.
+    { preHandler: [requireMerchantAuth, requireMerchantRole("owner", "finance")] },
     async (request, reply) => {
       const result = await voidTransaction(app.db, {
         transactionId: request.params.id,
@@ -158,17 +152,21 @@ export async function transactionRoutes(app: FastifyInstance): Promise<void> {
       const q = request.query;
       const status = q.status === undefined ? undefined : Array.isArray(q.status) ? q.status : [q.status];
 
-      const csv = await buildTransactionsExportCsv(app.db, {
-        merchantId: request.merchantAuth!.merchantId,
-        from: q.from ? new Date(q.from) : undefined,
-        to: q.to ? new Date(q.to) : undefined,
-        status,
-      });
-
-      reply
+      const from = q.from ? new Date(q.from) : undefined;
+      const to = q.to ? new Date(q.to) : undefined;
+      if ((from && Number.isNaN(from.getTime())) || (to && Number.isNaN(to.getTime()))) {
+        throw new BadRequestError("invalid_request", "from and to must be valid ISO-8601 timestamps");
+      }
+      // R4 fix: stream the CSV a page at a time instead of building it all in
+      // memory first (see transactionsExportCsvLines).
+      const stream = Readable.from(
+        transactionsExportCsvLines(app.db, { merchantId: request.merchantAuth!.merchantId, from, to, status }),
+        { objectMode: false }, // a byte stream, so Fastify can pipe it to the socket
+      );
+      return reply
         .header("content-type", "text/csv; charset=utf-8")
         .header("content-disposition", 'attachment; filename="transactions.csv"')
-        .send(csv);
+        .send(stream);
     },
   );
 

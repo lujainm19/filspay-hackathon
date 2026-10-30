@@ -154,23 +154,30 @@ export async function claimIdempotencyKey(
   }
 
   if (existing.status === "failed") {
+    // C6 fix: what was wrong — this UPDATE matched on id alone. Why it broke —
+    // two retries of the same failed request both read status = 'failed'; the
+    // second one's UPDATE waited for the first's row lock and then ran anyway,
+    // so both went on to call the acquirer. What it broke — a retried payment
+    // after an acquirer error could be charged twice. Requiring the row to
+    // still be 'failed' means only one retry wins; the other is told the
+    // request is already in progress.
     const updateResult = await client.query<IdempotencyKeyDbRow>(
       `UPDATE idempotency_keys SET status = 'in_progress', attempt_count = attempt_count + 1
-       WHERE id = $1
+       WHERE id = $1 AND status = 'failed'
        RETURNING *`,
       [existing.id],
     );
     const updated = updateResult.rows[0];
     if (!updated) {
-      throw new Error("claimIdempotencyKey: update after a failed claim returned no row");
+      return { outcome: "conflict_in_progress", row: toRow(existing) };
     }
     return { outcome: "retry_after_failure", row: toRow(updated) };
   }
 
-  // MK: processRefund commits the claim before the acquirer call, so in_progress can
-  // legitimately be seen there. 409 is correct, client just retries later
-  // YA: Claude suggested a stale-claim sweeper (in_progress older than 5 min -> failed)
-  // — ignore, sweeper already exists in scripts/sweep_idempotency.ts
+  // Note: there is no scripts/sweep_idempotency.ts (an old comment here said
+  // there was). Since processRefund now runs in one transaction like capture,
+  // an in_progress row only survives a crash between claim and COMMIT —
+  // Postgres rolls that back, so the row disappears rather than going stale.
   // existing.status === 'in_progress'. Given the blocking behavior above,
   // this is only reachable if a previous process claimed the key and then
   // crashed without ever reaching a COMMIT/ROLLBACK Postgres could detect —

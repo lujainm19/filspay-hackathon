@@ -28,6 +28,17 @@ export async function rotateApiKeyAsAdmin(
       throw new ConflictError("api_key_already_revoked");
     }
 
+    // A3 fix: what was wrong — rotation issued a new key but never revoked the
+    // old one. Why it matters — the usual reason to rotate is that the old key
+    // leaked; YA's handover is explicit that "rotation = revoke" (there was
+    // never a grace period). What it broke — a leaked key kept working forever
+    // after support "rotated" it. The old key is revoked in this same
+    // transaction, so a failed rotation still leaves the merchant with a key.
+    await client.query(
+      `UPDATE api_keys SET revoked_at = now(), revoked_reason = 'rotated' WHERE id = $1`,
+      [input.apiKeyId],
+    );
+
     const issued = await issueApiKeyInTx(client, config, {
       merchantId: input.merchantId,
       createdByAdminUserId: input.adminUserId,

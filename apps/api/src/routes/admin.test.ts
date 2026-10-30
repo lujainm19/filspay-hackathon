@@ -141,7 +141,9 @@ async function loginAdmin(email: string): Promise<string> {
     payload: { code: loginBody.devOtpCode },
   });
   assert.equal(verifyRes.statusCode, 200, verifyRes.body);
-  return cookie;
+  // S16: verify rotates the admin cookie; keep the new one like a browser would.
+  const freshCookie = parseCookie(verifyRes.headers["set-cookie"], config.adminCookieName);
+  return freshCookie;
 }
 
 async function signedInAdmin(role: AdminRole, label: string) {
@@ -567,6 +569,10 @@ test("a forced audit-write failure rolls the WHOLE bulk approval back", async ()
   const finance = await signedInAdmin("finance", "bulkkyc-auditfail");
   const first = await createMerchant("bulkkyc-auditfail-a");
   const second = await createMerchant("bulkkyc-auditfail-b");
+  // A5: bulk approve only touches merchants that are under review.
+  await pool.query(`UPDATE merchants SET onboarding_status = 'under_review' WHERE id = ANY($1)`, [
+    [first.merchantId, second.merchantId],
+  ]);
 
   await pool.query(
     `ALTER TABLE admin_audit_log
@@ -591,7 +597,7 @@ test("a forced audit-write failure rolls the WHOLE bulk approval back", async ()
   assert.equal(merchants.rowCount, 2);
   for (const row of merchants.rows) {
     assert.equal(row.kyc_passed, false, "the batch UPDATE must have rolled back for every merchant");
-    assert.equal(row.onboarding_status, "submitted");
+    assert.equal(row.onboarding_status, "under_review");
   }
   assert.equal((await auditRowsFor(finance.id, "kyc_bulk_approve")).length, 0);
 
@@ -795,9 +801,9 @@ test("GET /v1/admin/merchants/:id 404s for an unknown or malformed id", async ()
 
 // -------------------------------------------------- API key rotation
 
-// "previous key stays active" — grace period for merchants to deploy the new key. intended (am, 2026-05)
-// YA: there was never a grace period in the design. rotation = revoke
-test("API key rotation issues a new key atomically and audits it; the previous key stays active", async () => {
+// A3: this test used to assert the previous key "stays active", which is the
+// bug (a leaked key kept working after rotation). Per YA: rotation = revoke.
+test("API key rotation issues a new key atomically, revokes the previous one, and audits it", async () => {
   const finance = await signedInAdmin("finance", "rotate");
   const { merchantId, ownerUserId } = await createMerchant("rotate");
   const original = await issueApiKey(pool, config, { merchantId, createdBy: ownerUserId, label: "original" });
@@ -823,14 +829,13 @@ test("API key rotation issues a new key atomically and audits it; the previous k
   assert.ok(rotated.rawKey.startsWith("fp_test_"));
   assert.equal(rotated.prefix, rotated.rawKey.slice(0, 16));
 
-  // The previous key keeps authenticating through the overlap window —
-  // rotation issues a replacement without cutting the old credential off.
+  // The previous key stops working immediately.
   const after = await app.inject({
     method: "GET",
     url: "/v1/transactions",
     headers: { authorization: `Bearer ${original.rawKey}` },
   });
-  assert.equal(after.statusCode, 200, "the previous key stays active during the overlap window");
+  assert.equal(after.statusCode, 401, "the rotated-out key must no longer authenticate");
 
   // The new key works too.
   const withNew = await app.inject({
@@ -855,8 +860,8 @@ test("API key rotation issues a new key atomically and audits it; the previous k
   );
   assert.equal(rows.rowCount, 2);
   const [oldRow, newRow] = rows.rows;
-  assert.equal(oldRow!.revoked_at, null, "rotation does not revoke the previous key");
-  assert.equal(oldRow!.revoked_reason, null);
+  assert.ok(oldRow!.revoked_at, "rotation revokes the previous key");
+  assert.equal(oldRow!.revoked_reason, "rotated");
   assert.equal(newRow!.id, rotated.id);
   assert.equal(newRow!.revoked_at, null);
   assert.equal(newRow!.created_by, null, "0037's XOR: an admin-issued key has no merchant_users actor");
@@ -1639,4 +1644,27 @@ test("an mdr recalculation whose audit row cannot be written never makes the cal
     0,
     "an unloggable action must be BLOCKED, not merely unlogged",
   );
+});
+
+test("A5: bulk approve only approves merchants that are under review", async () => {
+  const finance = await signedInAdmin("finance", "bulkkyc-status");
+  const reviewing = await createMerchant("bulkkyc-status-review");
+  const rejected = await createMerchant("bulkkyc-status-rejected");
+  await pool.query(`UPDATE merchants SET onboarding_status = 'under_review' WHERE id = $1`, [reviewing.merchantId]);
+  await pool.query(`UPDATE merchants SET onboarding_status = 'rejected' WHERE id = $1`, [rejected.merchantId]);
+
+  const res = await app.inject({
+    method: "POST",
+    url: "/v1/admin/merchants/bulk-approve",
+    headers: { cookie: finance.cookie },
+    payload: { merchantIds: [reviewing.merchantId, rejected.merchantId] },
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  const rows = await pool.query<{ id: string; onboarding_status: string }>(
+    `SELECT id, onboarding_status FROM merchants WHERE id = ANY($1)`,
+    [[reviewing.merchantId, rejected.merchantId]],
+  );
+  const byId = new Map(rows.rows.map((r) => [r.id, r.onboarding_status]));
+  assert.equal(byId.get(reviewing.merchantId), "approved");
+  assert.equal(byId.get(rejected.merchantId), "rejected", "a rejected merchant must not be bulk-approved");
 });

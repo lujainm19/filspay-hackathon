@@ -6,6 +6,8 @@ export interface TransactionRow {
   status: string;
   amount_fils: string | number;
   captured_fils: string | number;
+  /** Added in 0043; optional only because a few hand-written SELECTs omit it. */
+  refunded_fils?: string | number;
   currency: string;
   reference: string | null;
   acquirer_reference: string;
@@ -24,6 +26,7 @@ export interface TransactionDto {
   status: string;
   amountFils: number;
   capturedFils: number;
+  refundedFils: number;
   currency: string;
   reference: string | null;
   acquirerReference: string;
@@ -34,7 +37,8 @@ export interface TransactionDto {
 /** The single place a `transactions` row is turned into its camelCase,
  *  JSON-serializable API shape — used by authorize/capture/void and the
  *  read endpoints alike, so the response shape can't drift between them. */
-// TODO(am): add refundedFils once 0043 is applied everywhere
+// FP-300: refundedFils is part of the response now, so the dashboard can show
+// how much went back and how much is still refundable.
 export function serializeTransaction(row: TransactionRow): TransactionDto {
   return {
     id: row.id,
@@ -42,6 +46,7 @@ export function serializeTransaction(row: TransactionRow): TransactionDto {
     status: row.status,
     amountFils: Number(row.amount_fils),
     capturedFils: Number(row.captured_fils),
+    refundedFils: Number(row.refunded_fils ?? 0),
     currency: row.currency,
     reference: row.reference,
     acquirerReference: row.acquirer_reference,

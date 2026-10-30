@@ -38,6 +38,20 @@ function getSignatureHeader(request: FastifyRequest): string | undefined {
  * endpoint has.
  */
 export async function acquirerCallbackRoutes(app: FastifyInstance): Promise<void> {
+  // S11: keep the exact bytes the acquirer sent so the signature is checked
+  // over them, not over our own re-serialisation of the parsed JSON. This
+  // parser only applies inside this plugin (Fastify scopes it), so other
+  // routes are untouched.
+  app.addContentTypeParser("application/json", { parseAs: "string" }, (request, body, done) => {
+    (request as FastifyRequest & { rawBody?: string }).rawBody = body as string;
+    try {
+      done(null, body === "" ? {} : JSON.parse(body as string));
+    } catch (err) {
+      (err as { statusCode?: number }).statusCode = 400;
+      done(err as Error, undefined);
+    }
+  });
+
   app.post<{ Body: AcquirerCallbackBody }>("/callbacks", async (request, reply) => {
     const body = request.body ?? {};
     if (
@@ -55,13 +69,19 @@ export async function acquirerCallbackRoutes(app: FastifyInstance): Promise<void
     }
 
     const verification = verifyAcquirerCallbackSignature(
-      body,
+      (request as FastifyRequest & { rawBody?: string }).rawBody ?? body,
       getSignatureHeader(request),
       app.config.acquirerCallbackSigningSecret,
       app.config.acquirerCallbackRequireSignature,
     );
     if (!verification.valid) {
       throw new UnauthorizedError("invalid_signature", verification.reason);
+    }
+
+    // The docs say outcome is checked against the allowed values; it wasn't —
+    // any string was cast straight through. Check it after the signature.
+    if (body.outcome !== "cleared" && body.outcome !== "confirmed_fraud") {
+      throw new BadRequestError("invalid_request", "outcome must be cleared or confirmed_fraud");
     }
 
     const callback: AcquirerCallbackInput = {

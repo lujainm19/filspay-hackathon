@@ -59,9 +59,15 @@ export async function initiateMerchantRefund(
 ): Promise<ProcessRefundResult> {
   await assertRefundsNotOnHold(pool, input.merchantId);
 
-  const result = await pool.query<{ id: string; merchant_id: string }>(
-    `SELECT id, merchant_id FROM transactions WHERE id = $1`,
-    [input.transactionId],
+  // S8 fix: what was wrong — the transaction was looked up by id alone and
+  // the refund then ran as the *transaction's* merchant. Why — the path's
+  // merchant check only proved who the caller is, not that the transaction is
+  // theirs. What it broke — merchant A could refund merchant B's sales, and
+  // the money would come out of B's balance. The lookup is now scoped to the
+  // caller's merchant, and processRefund locks it with the same filter.
+  const result = await pool.query<{ id: string }>(
+    `SELECT id FROM transactions WHERE id = $1 AND merchant_id = $2`,
+    [input.transactionId, input.merchantId],
   );
   const txn = result.rows[0];
   if (!txn) {
@@ -70,7 +76,7 @@ export async function initiateMerchantRefund(
 
   return processRefund(pool, acquirer, {
     transactionId: txn.id,
-    merchantId: txn.merchant_id,
+    merchantId: input.merchantId,
     amountFils: input.amountFils,
     idempotencyKey: input.idempotencyKey,
     actor: input.actor,
