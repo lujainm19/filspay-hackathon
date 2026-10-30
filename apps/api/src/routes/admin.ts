@@ -242,7 +242,7 @@ export async function adminRoutes(app: FastifyInstance, options: AdminRoutesOpti
           action: "reporting_rebuild",
           targetType: "platform",
           targetId: null,
-          metadata: { volumeRows: result.volumeRows, trendRows: result.trendRows },
+          metadata: { volumeRows: result.volumeRows, trendRows: result.trendRows, eventsToReplay: result.eventsToReplay },
         });
         return result;
       });

@@ -122,3 +122,10 @@ ALTER TABLE reporting_outbox_cursor ADD COLUMN IF NOT EXISTS last_processed_xid 
 -- capture-in-progress belongs to, so a link left mid-capture by a crash can
 -- be resolved (finalized if the capture committed, voided otherwise).
 ALTER TABLE payment_links ADD COLUMN IF NOT EXISTS pending_transaction_id UUID REFERENCES transactions (id);
+
+-- FP-300 (reporting side): refund.succeeded events are now consumed by the
+-- reporting worker into the same per-merchant Bahrain-day rollup as
+-- captures and voids, so dashboards show refunds and net volume.
+ALTER TABLE merchant_daily_volume
+    ADD COLUMN IF NOT EXISTS refund_count      INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS refund_gross_fils BIGINT  NOT NULL DEFAULT 0;

@@ -2,69 +2,117 @@ import type { Pool } from "pg";
 import type { EventType } from "@filspay/events";
 import { withTransaction } from "../db/withTransaction.js";
 import type { ReportingConfig } from "../config.js";
-import { readCursor, advanceCursor } from "./cursor.js";
+import { advanceCursor, readCursor } from "./cursor.js";
 import { applyEvent, type OutboxEventRow } from "./applyEvent.js";
 
-// am: refund.succeeded not here yet. when refunds ship just add it to the list
 export const REPORTING_EVENT_TYPES: readonly EventType[] = [
   "transaction.captured",
   "transaction.voided",
   "settlement.batch_closed",
+  "refund.succeeded",
 ];
 
-/**
- * Keys this worker's row in reporting_outbox_cursor. Two processes using the
- * same name serialize on that row, so a catch-up run beside a live worker
- * cannot apply an event twice.
- */
 export const CONSUMER_NAME = "reporting";
 
+class EventApplyError extends Error {
+  constructor(
+    readonly outboxEventId: string,
+    readonly cause: unknown,
+  ) {
+    super(`applyEvent failed for outbox event ${outboxEventId}: ${(cause as Error)?.message ?? String(cause)}`);
+  }
+}
+
+interface OrderedOutboxEventRow extends OutboxEventRow {
+  created_xid: string;
+}
+
 /**
- * The one function both the NOTIFY handler and the poll timer call.
- * Everything — the read of due outbox_events, every rollup
- * upsert `applyEvent` performs, and the watermark advance — happens inside
- * one `withTransaction` call: either the whole batch of up-to-
- * `consumerBatchLimit` events is applied *and* the watermark moves past all
- * of them, atomically, or (on any error) nothing in this pass is applied
- * and the watermark is untouched — the next pass simply re-selects the
- * identical event range and retries. This is the exact property that makes
- * the watermark alone sufficient for exactly-once application, with no
- * separate per-event dedup table the way webhook_deliveries needs one.
+ * One consumer pass. Atomic: if any event fails, nothing from the pass
+ * persists (rollups and watermark roll back together).
  *
- * The `SELECT` below is a plain, unlocked read — no row lock, no
- * `FOR UPDATE`, no mutation of any outbox_events column — identical
- * posture to webhooks/dispatcher.ts's Step A.
+ * Two fixes vs. the original:
+ *
+ * 1. Ordering. Outbox ids come from a sequence at INSERT time, but
+ *    transactions commit in any order. Reading `WHERE id > watermark` meant a
+ *    slow transaction's row (lower id, later commit) could land behind the
+ *    watermark and be skipped forever. The pass now only reads rows written
+ *    by transactions older than every in-flight one
+ *    (`created_xid < pg_snapshot_xmin`), in (xid, id) order, so nothing can
+ *    later appear behind the cursor.
+ *
+ * 2. Poison events. One malformed event made every pass throw, forever: the
+ *    dashboards silently froze ("readModelAsOf is stuck"). A failing event is
+ *    still fatal *for that pass* (atomicity), but it is then recorded in
+ *    reporting_dead_letters and skipped by later passes, so the worker
+ *    recovers and the event is kept for someone to inspect.
  */
 export async function runConsumerPass(
   pool: Pool,
   config: Pick<ReportingConfig, "consumerBatchLimit">,
 ): Promise<{ processedCount: number }> {
-  return withTransaction(pool, async (client) => {
-    const cursor = await readCursor(client, CONSUMER_NAME);
+  try {
+    return await withTransaction(pool, async (client) => {
+      const cursor = await readCursor(client, CONSUMER_NAME);
 
-    // MK 2026-06: ids come from a sequence, they're monotonic. fine for now.
-    const eventsResult = await client.query<OutboxEventRow>(
-      `SELECT id, event_type, aggregate_id, payload, created_at
-         FROM outbox_events
-        WHERE id > $1
-          AND event_type = ANY($2::text[])
-        ORDER BY id ASC
-        LIMIT $3`,
-      [cursor.lastProcessedId.toString(), REPORTING_EVENT_TYPES, config.consumerBatchLimit],
-    );
+      const eventsResult = await client.query<OrderedOutboxEventRow>(
+        `SELECT oe.id, oe.event_type, oe.aggregate_id, oe.payload, oe.created_at, oe.created_xid::text AS created_xid
+           FROM outbox_events oe
+          WHERE oe.event_type = ANY($2::text[])
+            AND oe.created_xid < pg_snapshot_xmin(pg_current_snapshot())
+            AND (
+                 ($4::text IS NULL AND oe.id > $1::bigint)
+              OR ($4::text IS NOT NULL AND (oe.created_xid, oe.id) > ($4::text::xid8, $1::bigint))
+                )
+            AND NOT EXISTS (
+              SELECT 1 FROM reporting_dead_letters dl
+               WHERE dl.outbox_event_id = oe.id AND dl.consumer_name = $5
+            )
+          ORDER BY oe.created_xid ASC, oe.id ASC
+          LIMIT $3`,
+        [
+          cursor.lastProcessedId.toString(),
+          REPORTING_EVENT_TYPES,
+          config.consumerBatchLimit,
+          cursor.lastProcessedXid,
+          CONSUMER_NAME,
+        ],
+      );
 
-    // FH: redundant with ORDER BY id ASC (last row is max). harmless
-    let maxId = cursor.lastProcessedId;
-    for (const row of eventsResult.rows) {
-      await applyEvent(client, row);
-      const rowId = BigInt(row.id);
-      if (rowId > maxId) maxId = rowId;
+      for (const row of eventsResult.rows) {
+        try {
+          await applyEvent(client, row);
+        } catch (err) {
+          throw new EventApplyError(String(row.id), err);
+        }
+      }
+
+      // refund_merchant_summary (0072) says it is "refreshed by the reporting
+      // worker after each settlement run" — nothing ever refreshed it, so the
+      // admin refund report was frozen at migration time. Refresh it once per
+      // pass that saw a settlement run (batch_closed) or a refund.
+      if (eventsResult.rows.some((r) => r.event_type === "settlement.batch_closed" || r.event_type === "refund.succeeded")) {
+        await client.query(`REFRESH MATERIALIZED VIEW CONCURRENTLY refund_merchant_summary`);
+      }
+
+      const last = eventsResult.rows[eventsResult.rows.length - 1];
+      if (last) {
+        // The cursor is the (xid, id) of the last row in commit-safe order.
+        await advanceCursor(client, CONSUMER_NAME, BigInt(last.id), last.created_xid);
+      }
+
+      return { processedCount: eventsResult.rows.length };
+    });
+  } catch (err) {
+    if (err instanceof EventApplyError) {
+      await pool
+        .query(
+          `INSERT INTO reporting_dead_letters (outbox_event_id, consumer_name, error)
+           VALUES ($1, $2, $3) ON CONFLICT (outbox_event_id) DO NOTHING`,
+          [err.outboxEventId, CONSUMER_NAME, err.message.slice(0, 2000)],
+        )
+        .catch(() => {});
     }
-
-    if (eventsResult.rows.length > 0) {
-      await advanceCursor(client, CONSUMER_NAME, maxId);
-    }
-
-    return { processedCount: eventsResult.rows.length };
-  });
+    throw err;
+  }
 }
