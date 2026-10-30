@@ -1,17 +1,3 @@
-// YA (Mar): parked until the refunds API exists — FP-212
-// MK: drawer is done, just uncomment + add the route. 30 min job
-// FH: claude review: posts to /v1/refunds but initiateMerchantRefund expects /v1/merchants/:id/refunds,
-// and it makes a new idempotency key per click. check before uncommenting
-// max refund = captured is right, partial refunds are tracked server side — am
-/**
- * Parked, not wired. The drawer is finished, but `POST /v1/refunds` still
- * answers 501, so shipping the control would only put a dead button on every
- * transaction page. Restore this file and add its route in the same change —
- * it is deliberately imported nowhere in the meantime so the bundle does not
- * carry it.
- */
-
-/*
 import { useState } from "react";
 import { request } from "../../api/client.js";
 import { describeError } from "../../api/client.js";
@@ -19,6 +5,24 @@ import { useDashboardAuth } from "../../auth/DashboardAuthContext.js";
 import { RequireRole } from "../../auth/RequireRole.js";
 import { bhd } from "../../format.js";
 import type { TransactionDto } from "../../types.js";
+
+/**
+ * FP-300: the refund control on the transaction page, now wired to
+ * POST /v1/merchants/:merchantId/refunds.
+ *
+ * It was finished but commented out while the API answered 501. Three things
+ * changed when switching it on:
+ *  - A partially refunded transaction can be refunded again; before, the button
+ *    disappeared after the first partial refund.
+ *  - The maximum is what's still refundable (captured − already refunded), not
+ *    the captured total.
+ *  - One Idempotency-Key per refund attempt, created when the form opens and
+ *    kept for retries of that same attempt, so a double-click or a retry after
+ *    a network blip can't refund twice. A new key is made after a success.
+ *
+ * Hiding the button from support is only a convenience; the API enforces
+ * owner/finance itself.
+ */
 
 interface RefundResponse {
   id: string;
@@ -36,19 +40,23 @@ interface RefundDrawerProps {
   onRefunded: () => Promise<void>;
 }
 
+const REFUNDABLE_STATUSES = new Set(["captured", "partially_captured", "partially_refunded"]);
+
 export function RefundDrawer({ txn, onRefunded }: RefundDrawerProps) {
   const { me } = useDashboardAuth();
   const [open, setOpen] = useState(false);
   const [amount, setAmount] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [idempotencyKey, setIdempotencyKey] = useState<string>(() => crypto.randomUUID());
 
   const merchantId = me?.merchant.id;
-  const refundable = txn.status === "captured" || txn.status === "partially_captured";
+  const refundableFils = txn.capturedFils - txn.refundedFils;
+  const refundable = REFUNDABLE_STATUSES.has(txn.status) && refundableFils > 0;
 
   async function handleRefund(event: React.FormEvent): Promise<void> {
     event.preventDefault();
-    if (!merchantId) return;
+    if (!merchantId || submitting) return;
     if (!window.confirm("Refund this transaction? The money goes back to the cardholder and cannot be recalled.")) {
       return;
     }
@@ -57,23 +65,20 @@ export function RefundDrawer({ txn, onRefunded }: RefundDrawerProps) {
     setError(null);
     try {
       const trimmed = amount.trim();
-      // Left blank, amountFils is omitted entirely and the API refunds
-      // everything still refundable — its own documented default, same
-      // affordance the capture form has.
+      // Left blank, amountFils is omitted and the API refunds everything that's
+      // still refundable.
       const body = trimmed === "" ? { transactionId: txn.id } : { transactionId: txn.id, amountFils: Number(trimmed) };
 
       await request<RefundResponse>(`/v1/merchants/${encodeURIComponent(merchantId)}/refunds`, {
         method: "POST",
-        // A fresh key per click, including a retry after a decline — same
-        // discipline as capture and the checkout page's submit handler.
-        headers: { "Idempotency-Key": crypto.randomUUID() },
+        headers: { "Idempotency-Key": idempotencyKey },
         body: JSON.stringify(body),
       });
 
       setOpen(false);
       setAmount("");
-      // Refetch rather than patch: the refund wrote a new transaction_events
-      // row server-side, so the timeline is stale, not merely shorter.
+      setIdempotencyKey(crypto.randomUUID()); // the next refund is a new attempt
+      // Refetch rather than patch: the refund added a timeline event server-side.
       await onRefunded();
     } catch (err) {
       setError(describeError(err));
@@ -96,12 +101,12 @@ export function RefundDrawer({ txn, onRefunded }: RefundDrawerProps) {
                 type="number"
                 min={1}
                 step={1}
-                max={txn.capturedFils}
+                max={refundableFils}
                 value={amount}
                 onChange={(e) => setAmount(e.target.value)}
               />
             </label>
-            <p className="dash-muted">Captured so far: {bhd(txn.capturedFils)}</p>
+            <p className="dash-muted">Still refundable: {bhd(refundableFils)}</p>
             <button type="submit" className="dash-button" disabled={submitting}>
               {submitting ? "Refunding..." : "Refund"}
             </button>
@@ -118,6 +123,3 @@ export function RefundDrawer({ txn, onRefunded }: RefundDrawerProps) {
     </RequireRole>
   );
 }
-*/
-
-export {};
