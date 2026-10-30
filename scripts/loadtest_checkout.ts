@@ -14,6 +14,11 @@ const BASE = process.env.BASE_URL ?? "http://localhost:3000";
 const KEY = process.env.API_KEY ?? "";
 const MERCHANT = process.env.MERCHANT_ID ?? "";
 const DURATION_MS = Number(process.env.DURATION_MS ?? 20_000);
+// RESPECT_RETRY_AFTER=1: after a 503 the virtual user waits the Retry-After
+// the server sent (as a browser or SDK would) instead of retrying instantly.
+// Without it, rejected users hammer the API in a tight loop, which measures
+// how fast we can say "no" more than how many buyers we can serve.
+const RESPECT_RETRY_AFTER = process.env.RESPECT_RETRY_AFTER === "1";
 const CARD = { pan: "4242424242424242", expiryMonth: 12, expiryYear: 2030, cvv: "123" };
 
 async function call(method: string, path: string, body?: unknown, headers: Record<string, string> = {}) {
@@ -57,6 +62,7 @@ async function run(vus: number) {
         try {
           const r = await checkout();
           statuses[r.status] = (statuses[r.status] ?? 0) + 1;
+          if (RESPECT_RETRY_AFTER && r.status === 503) await new Promise((res) => setTimeout(res, 1_000));
           if (r.ok) {
             ok += 1;
             latencies.push(r.ms);
