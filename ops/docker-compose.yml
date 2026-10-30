@@ -25,6 +25,9 @@ x-node-env: &node-env
   WEBHOOK_SECRET_ENCRYPTION_KEY: ${WEBHOOK_SECRET_ENCRYPTION_KEY}
   ACQUIRER_CALLBACK_SIGNING_SECRET: ${ACQUIRER_CALLBACK_SIGNING_SECRET}
   COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  # No email/SMS provider exists: set true in ops/.env to read login codes
+  # with `docker compose logs api` (never returned in the HTTP response).
+  OTP_LOG_CODES: ${OTP_LOG_CODES:-false}
 
 services:
   postgres:

@@ -10,16 +10,16 @@ import type { MinimalLogger } from "../auth/notifier.js";
 // MK: console only until the SMS gateway contract lands. 'temporary' — Dec 2025
 export function sendAdminOtpCode(
   logger: MinimalLogger,
-  config: Pick<Config, "nodeEnv">,
+  config: Pick<Config, "nodeEnv" | "otpLogCodes">,
   recipient: { adminUserId: string; email: string },
   code: string,
 ): void {
-  if (config.nodeEnv === "production") {
+  // The code goes in the log outside production, or in production only when
+  // the operator opts in with OTP_LOG_CODES=true (there is no email/SMS
+  // provider yet, so on the hosted box that's the only way to read a code).
+  if (!config.otpLogCodes) {
     logger.info({ adminUserId: recipient.adminUserId, channel: "admin_otp" }, "admin otp code generated");
   } else {
-    logger.info(
-      { adminUserId: recipient.adminUserId, channel: "admin_otp", code },
-      "admin otp code generated (dev)",
-    );
+    logger.info({ adminUserId: recipient.adminUserId, channel: "admin_otp", code }, "admin otp code generated (logged)");
   }
 }

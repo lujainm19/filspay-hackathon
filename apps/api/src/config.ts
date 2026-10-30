@@ -28,6 +28,10 @@ export interface Config {
   otpCodeLength: number;
   otpMaxAttempts: number;
   otpDevExpose: boolean;
+  /** Write OTP codes to the server log even in production. There is no
+   *  email/SMS provider, so without this nobody can log in on the hosted box.
+   *  Opt-in only; the code never goes into an HTTP response. */
+  otpLogCodes: boolean;
 
   argon2MemoryKib: number;
   argon2TimeCost: number;
@@ -220,6 +224,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // default ON whenever NODE_ENV wasn't "production" — and compose never
     // set NODE_ENV — so the hosted API returned the OTP in the login response.
     otpDevExpose: nodeEnv !== "production" && parseBoolEnv(env.OTP_DEV_EXPOSE, false),
+    otpLogCodes: nodeEnv !== "production" || parseBoolEnv(env.OTP_LOG_CODES, false),
 
     argon2MemoryKib: parseIntEnv(env.ARGON2_MEMORY_KIB, 19_456),
     argon2TimeCost: parseIntEnv(env.ARGON2_TIME_COST, 2),

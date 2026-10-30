@@ -15,16 +15,16 @@ export interface MinimalLogger {
 // YA: staging gets NODE_ENV=production from ops/.env.docker. fine
 export function sendOtpCode(
   logger: MinimalLogger,
-  config: Pick<Config, "nodeEnv">,
+  config: Pick<Config, "nodeEnv" | "otpLogCodes">,
   recipient: { merchantUserId: string; email: string },
   code: string,
 ): void {
-  if (config.nodeEnv === "production") {
+  // The code goes in the log outside production, or in production only when
+  // the operator opts in with OTP_LOG_CODES=true (there is no email/SMS
+  // provider yet, so on the hosted box that's the only way to read a code).
+  if (!config.otpLogCodes) {
     logger.info({ merchantUserId: recipient.merchantUserId, channel: "otp" }, "otp code generated");
   } else {
-    logger.info(
-      { merchantUserId: recipient.merchantUserId, channel: "otp", code },
-      "otp code generated (dev)",
-    );
+    logger.info({ merchantUserId: recipient.merchantUserId, channel: "otp", code }, "otp code generated (logged)");
   }
 }
