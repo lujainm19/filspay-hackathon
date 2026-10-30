@@ -34,10 +34,14 @@ export async function applyAcquirerCallback(pool: Pool, callback: AcquirerCallba
     throw new NotFoundError("transaction_not_found");
   }
 
+  // C5 fix (FP-201): a re-sent callback used to add a second identical note.
+  // With the unique index from migration 0081, a repeat is simply ignored, so
+  // acquirer retries (and our own withCallbackRetry) are safe.
   await pool.query(
     `INSERT INTO acquirer_callback_notes
         (transaction_id, merchant_id, callback_id, callback_type, outcome, note, received_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (transaction_id, callback_id) DO NOTHING`,
     [
       callback.transactionId,
       txnRow.merchant_id,

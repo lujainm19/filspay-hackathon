@@ -78,6 +78,12 @@ export async function acquirerCallbackRoutes(app: FastifyInstance): Promise<void
       throw new UnauthorizedError("invalid_signature", verification.reason);
     }
 
+    // The docs say outcome is checked against the allowed values; it wasn't —
+    // any string was cast straight through. Check it after the signature.
+    if (body.outcome !== "cleared" && body.outcome !== "confirmed_fraud") {
+      throw new BadRequestError("invalid_request", "outcome must be cleared or confirmed_fraud");
+    }
+
     const callback: AcquirerCallbackInput = {
       callbackId: body.callbackId,
       type: "fraud_review.completed",
