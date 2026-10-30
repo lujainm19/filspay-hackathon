@@ -76,7 +76,10 @@ export async function reportingRoutes(app: FastifyInstance): Promise<void> {
     async (request) => listSavedFilters(app.db, { merchantId: request.merchantAuth!.merchantId }),
   );
 
-  app.get("/export-summary", async (request) => {
+  // S19 fix: this route had no auth hook, so request.merchantAuth was always
+  // undefined and every call crashed with a 500. It now needs a login like
+  // the other reporting routes.
+  app.get("/export-summary", { preHandler: requireMerchantAuth }, async (request) => {
     const result = await app.db.query(
       `SELECT COUNT(*) AS total, SUM(captured_gross_fils) AS gross
          FROM merchant_daily_volume WHERE merchant_id = $1`,
