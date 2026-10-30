@@ -1,20 +1,6 @@
-// YA (Mar): parked until the refunds API exists — FP-212
-// MK: drawer is done, just uncomment + add the route. 30 min job
-// FH: claude review: posts to /v1/refunds but initiateMerchantRefund expects /v1/merchants/:id/refunds,
-// and it makes a new idempotency key per click. check before uncommenting
-// max refund = captured is right, partial refunds are tracked server side — am
-/**
- * Parked, not wired. The drawer is finished, but `POST /v1/refunds` still
- * answers 501, so shipping the control would only put a dead button on every
- * transaction page. Restore this file and add its route in the same change —
- * it is deliberately imported nowhere in the meantime so the bundle does not
- * carry it.
- */
-
-/*
 import { useState } from "react";
-import { request } from "../../api/client.js";
-import { describeError } from "../../api/client.js";
+import { parseBhdToFils } from "@filspay/money";
+import { describeError, request } from "../../api/client.js";
 import { useDashboardAuth } from "../../auth/DashboardAuthContext.js";
 import { RequireRole } from "../../auth/RequireRole.js";
 import { bhd } from "../../format.js";
@@ -22,13 +8,10 @@ import type { TransactionDto } from "../../types.js";
 
 interface RefundResponse {
   id: string;
-  transactionId: string;
   amountFils: number;
   feeReversedFils: number;
-  status: string;
   transactionStatus: string;
   refundedTotalFils: number;
-  occurredAt: string;
 }
 
 interface RefundDrawerProps {
@@ -36,44 +19,70 @@ interface RefundDrawerProps {
   onRefunded: () => Promise<void>;
 }
 
+const REFUNDABLE = new Set(["captured", "partially_captured", "partially_refunded"]);
+
+/**
+ * Refund control (FP-212), wired to POST /v1/merchants/:id/refunds.
+ *
+ * Changes from the parked draft:
+ *  - amount is entered in BD ("4.750"), like every other money field a
+ *    merchant sees, instead of raw fils;
+ *  - one Idempotency-Key per *refund attempt* (generated when the drawer
+ *    opens, renewed only after a definitive answer), so a double-click or a
+ *    network retry can never refund twice — the draft minted a key per click;
+ *  - shown for partially_refunded too, so a second partial refund is possible;
+ *  - the result (amount, fee given back) is confirmed on screen.
+ */
 export function RefundDrawer({ txn, onRefunded }: RefundDrawerProps) {
   const { me } = useDashboardAuth();
   const [open, setOpen] = useState(false);
   const [amount, setAmount] = useState("");
+  const [reason, setReason] = useState("");
+  const [idempotencyKey, setIdempotencyKey] = useState(() => crypto.randomUUID());
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<string | null>(null);
 
   const merchantId = me?.merchant.id;
-  const refundable = txn.status === "captured" || txn.status === "partially_captured";
+  if (!REFUNDABLE.has(txn.status)) return null;
 
   async function handleRefund(event: React.FormEvent): Promise<void> {
     event.preventDefault();
-    if (!merchantId) return;
-    if (!window.confirm("Refund this transaction? The money goes back to the cardholder and cannot be recalled.")) {
-      return;
+    if (!merchantId || submitting) return;
+
+    let amountFils: number | undefined;
+    const trimmed = amount.trim();
+    if (trimmed !== "") {
+      try {
+        amountFils = parseBhdToFils(trimmed);
+      } catch {
+        setError("Enter the amount in BD, e.g. 4.750");
+        return;
+      }
+      if (amountFils <= 0) {
+        setError("The amount must be more than zero");
+        return;
+      }
     }
+    const label = amountFils === undefined ? "everything still refundable" : bhd(amountFils);
+    if (!window.confirm(`Refund ${label}? The money goes back to the cardholder and cannot be recalled.`)) return;
 
     setSubmitting(true);
     setError(null);
     try {
-      const trimmed = amount.trim();
-      // Left blank, amountFils is omitted entirely and the API refunds
-      // everything still refundable — its own documented default, same
-      // affordance the capture form has.
-      const body = trimmed === "" ? { transactionId: txn.id } : { transactionId: txn.id, amountFils: Number(trimmed) };
-
-      await request<RefundResponse>(`/v1/merchants/${encodeURIComponent(merchantId)}/refunds`, {
+      const body: Record<string, unknown> = { transactionId: txn.id };
+      if (amountFils !== undefined) body.amountFils = amountFils;
+      if (reason.trim() !== "") body.reason = reason.trim();
+      const res = await request<RefundResponse>(`/v1/merchants/${encodeURIComponent(merchantId)}/refunds`, {
         method: "POST",
-        // A fresh key per click, including a retry after a decline — same
-        // discipline as capture and the checkout page's submit handler.
-        headers: { "Idempotency-Key": crypto.randomUUID() },
+        headers: { "Idempotency-Key": idempotencyKey },
         body: JSON.stringify(body),
       });
-
+      setDone(`Refunded ${bhd(res.amountFils)} (fee returned: ${bhd(res.feeReversedFils)}).`);
       setOpen(false);
       setAmount("");
-      // Refetch rather than patch: the refund wrote a new transaction_events
-      // row server-side, so the timeline is stale, not merely shorter.
+      setReason("");
+      setIdempotencyKey(crypto.randomUUID());
       await onRefunded();
     } catch (err) {
       setError(describeError(err));
@@ -82,35 +91,45 @@ export function RefundDrawer({ txn, onRefunded }: RefundDrawerProps) {
     }
   }
 
-  if (!refundable) return null;
-
   return (
     <RequireRole allow={["owner", "finance"]}>
       <div className="dash-actions">
-        {error ? <p className="dash-error">{error}</p> : null}
+        {done ? <p className="dash-success" role="status">{done}</p> : null}
+        {error ? <p className="dash-error" role="alert">{error}</p> : null}
         {open ? (
           <form className="dash-form dash-form-inline" onSubmit={(e) => void handleRefund(e)}>
             <label>
-              Amount in fils (blank refunds everything still refundable)
+              Amount (BD) — leave blank to refund everything still refundable
               <input
-                type="number"
-                min={1}
-                step={1}
-                max={txn.capturedFils}
+                type="text"
+                inputMode="decimal"
+                placeholder="e.g. 4.750"
                 value={amount}
                 onChange={(e) => setAmount(e.target.value)}
               />
             </label>
-            <p className="dash-muted">Captured so far: {bhd(txn.capturedFils)}</p>
+            <label>
+              Reason (optional)
+              <input type="text" maxLength={200} value={reason} onChange={(e) => setReason(e.target.value)} />
+            </label>
+            <p className="dash-muted">Captured: {bhd(txn.capturedFils)}</p>
             <button type="submit" className="dash-button" disabled={submitting}>
-              {submitting ? "Refunding..." : "Refund"}
+              {submitting ? "Refunding…" : "Refund"}
             </button>
             <button type="button" className="dash-button" disabled={submitting} onClick={() => setOpen(false)}>
               Cancel
             </button>
           </form>
         ) : (
-          <button type="button" className="dash-button" onClick={() => setOpen(true)}>
+          <button
+            type="button"
+            className="dash-button"
+            onClick={() => {
+              setDone(null);
+              setError(null);
+              setOpen(true);
+            }}
+          >
             Refund
           </button>
         )}
@@ -118,6 +137,3 @@ export function RefundDrawer({ txn, onRefunded }: RefundDrawerProps) {
     </RequireRole>
   );
 }
-*/
-
-export {};
