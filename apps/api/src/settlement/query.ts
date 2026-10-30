@@ -1,5 +1,4 @@
 import type { Pool } from "pg";
-import { estimateFeeFils } from "../fees/estimate.js";
 
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
@@ -285,7 +284,7 @@ export async function getReconciliationReport(
   const windowStart = bahrainLocalMidnightUtc(input.from);
   const windowEnd = bahrainLocalMidnightUtc(input.to);
 
-  const [ledgerResult, settlementResult, pendingResult, merchantResult] = await Promise.all([
+  const [ledgerResult, settlementResult, pendingResult, pendingRefundsResult] = await Promise.all([
     pool.query<{ net: string }>(
       `SELECT COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount_fils ELSE -amount_fils END), 0) AS net
          FROM ledger_entries
@@ -300,8 +299,17 @@ export async function getReconciliationReport(
           AND status IN ('closed', 'paid')`,
       [input.merchantId, input.from, input.to],
     ),
-    pool.query<{ amount_fils: string | number }>(
-      `SELECT te.amount_fils
+    // M12 fix: what was wrong — the pending figure re-estimated each fee with
+    // float maths (estimateFeeFils, Math.round) from merchants.mdr_bps. Why it
+    // broke — capture charges the effective-dated fee_schedules rate minus the
+    // volume tier, rounded half-to-even; the "0046 trigger" that the old note
+    // said keeps mdr_bps in sync doesn't exist. What it broke — any merchant
+    // with a schedule, a discount or an odd half-fil showed a "gap" that was
+    // really just our own estimate being wrong. Now we use the fee capture
+    // actually recorded on the event (metadata.feeFils), which is exactly what
+    // went into the ledger.
+    pool.query<{ net: string }>(
+      `SELECT COALESCE(SUM(te.amount_fils - COALESCE((te.metadata->>'feeFils')::bigint, 0)), 0)::text AS net
          FROM transaction_events te
          JOIN transactions t ON t.id = te.transaction_id
         WHERE t.merchant_id = $1 AND te.event_type IN ('captured', 'partially_captured')
@@ -309,24 +317,20 @@ export async function getReconciliationReport(
           AND te.occurred_at >= $2 AND te.occurred_at < $3`,
       [input.merchantId, windowStart, windowEnd],
     ),
-    pool.query<{ mdr_bps: number; negotiated_discount_bps: number }>(
-      `SELECT mdr_bps, negotiated_discount_bps FROM merchants WHERE id = $1`,
-      [input.merchantId],
+    // FP-300: a refund moves merchant_payable straight away (gross back out,
+    // fee back in) but isn't in a batch until settlement picks it up, so it's
+    // pending too — otherwise every refund shows up as an unexplained gap.
+    pool.query<{ net: string }>(
+      `SELECT COALESCE(SUM(amount_fils - fee_reversed_fils), 0)::text AS net
+         FROM refunds
+        WHERE merchant_id = $1 AND status = 'succeeded' AND settlement_batch_id IS NULL
+          AND occurred_at >= $2 AND occurred_at < $3`,
+      [input.merchantId, windowStart, windowEnd],
     ),
   ]);
 
-  // MK: merchants.mdr_bps is kept in sync with the current fee_schedules row by the 0046 trigger,
-  // so reading it here is the same as resolving the schedule
-  const merchant = merchantResult.rows[0];
-  const mdrBps = merchant?.mdr_bps ?? 0;
-  const discountBps = merchant?.negotiated_discount_bps ?? 0;
-
-  let pendingUnbatchedFils = 0;
-  for (const row of pendingResult.rows) {
-    const amountFils = Number(row.amount_fils);
-    const feeFils = estimateFeeFils(amountFils, mdrBps, discountBps);
-    pendingUnbatchedFils += amountFils - feeFils;
-  }
+  const pendingUnbatchedFils =
+    Number(pendingResult.rows[0]?.net ?? 0) - Number(pendingRefundsResult.rows[0]?.net ?? 0);
 
   const ledgerMerchantPayableNetFils = Number(ledgerResult.rows[0]?.net ?? 0);
   const settlementNetPayoutFils = Number(settlementResult.rows[0]?.total ?? 0);
@@ -363,18 +367,20 @@ export async function getSettlementSummary(
   const windowStart = bahrainLocalMidnightUtc(input.from);
   const windowEnd = bahrainLocalMidnightUtc(input.to);
 
+  // M11 fix: what was wrong — this joined every capture *event* to its
+  // transaction and summed t.captured_fils, the transaction's running total.
+  // Why it broke — a transaction captured in three parts appeared three times,
+  // each time with its full total. What it broke — Delta Wholesale (the
+  // multi-capture merchant) saw a total about 38% too high; the perf doc's
+  // "timing difference" explanation was wrong. Sum each event's own amount.
   const result = await pool.query<SettlementSummaryRow>(
-    `WITH captured AS (
-       SELECT t.id, t.captured_fils
-         FROM transactions t
-         JOIN transaction_events te ON te.transaction_id = t.id
-        WHERE t.merchant_id = $1
-          AND te.event_type IN ('captured', 'partially_captured')
-          AND te.occurred_at >= $2 AND te.occurred_at < $3
-     )
-     SELECT COUNT(DISTINCT id) AS transaction_count,
-            COALESCE(SUM(captured_fils), 0) AS total_captured_fils
-       FROM captured`,
+    `SELECT COUNT(DISTINCT te.transaction_id) AS transaction_count,
+            COALESCE(SUM(te.amount_fils), 0) AS total_captured_fils
+       FROM transaction_events te
+       JOIN transactions t ON t.id = te.transaction_id
+      WHERE t.merchant_id = $1
+        AND te.event_type IN ('captured', 'partially_captured')
+        AND te.occurred_at >= $2 AND te.occurred_at < $3`,
     [input.merchantId, windowStart, windowEnd],
   );
 
