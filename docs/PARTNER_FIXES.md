@@ -100,3 +100,17 @@ they pinned a bug.
 `ops/.env.docker` (acquirer callback signing secret) was committed. It is
 untracked now, but it is still in history — rotate it with the acquirer and
 generate fresh secrets with `ops/gen-secrets.sh`.
+
+## 7. What Lujain's branch picked (merged on top of this one)
+
+| Topic | Picked | Where |
+| --- | --- | --- |
+| Session token after OTP | **A** — rotate the token *and* re-issue the cookie with the full TTL; the login test helpers now keep the cookie from the verify response | `routes/auth.ts`, `routes/adminAuth.ts`, `sessions.ts` |
+| API key rotation | **B** — 24 h overlap via `revoke_after`, checked in `verifyApiKey` | `admin/apiKeys.ts`, `apiKeys/verify.ts` |
+| Webhook replay | **B** — new delivery row, same `Webhook-Delivery-Id` / envelope `id`; no second payout side effect | `webhooks/replay.ts`, `dispatcher.ts` |
+| Refund race (FP-209) | **B** — reserve (pending row) → acquirer with no lock → settle; crash recovery retries with the same acquirer key | `payments/processRefund.ts`, migration 0076 |
+| Fee order (M9) | **B** — discount off the amount, then MDR (matches Go) | `payments/capture.ts` |
+| Analytics rebuild (A6) | **B** — Ghadah's version kept | `admin/reportingRebuild.ts` |
+
+Lujain's migrations: 0074 (refunded ≤ captured CHECK), 0075 (capture-event
+index for R6), 0076 (pending refund reservation).
