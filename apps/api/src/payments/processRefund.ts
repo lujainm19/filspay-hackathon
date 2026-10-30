@@ -186,7 +186,10 @@ export async function processRefund(
         prepared.requestedAmount,
         feeReversedFils,
         acquirerResult.acquirerReference,
-        input.reason ?? null,
+        // B6: 0070 made reason NOT NULL (default 'unspecified'); passing an explicit
+        // NULL bypassed the default and failed the CHECK, so every refund without a
+        // reason errored.
+        input.reason ?? "unspecified",
         input.actor.type,
         input.actor.id,
       ],
