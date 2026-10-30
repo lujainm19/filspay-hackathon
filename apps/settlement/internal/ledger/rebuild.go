@@ -86,7 +86,12 @@ func RebuildAllBalances(ctx context.Context, db *pgxpool.Pool) (map[uuid.UUID]Re
 	}
 	rows.Close()
 
-	// TODO: lock merchant_balances rows first, a concurrent CloseBatch increment gets clobbered -- YA
+	// Block concurrent incremental writers (CloseBatch, payouts, credits)
+	// for the duration of the rebuild, so an increment that lands between our
+	// read of the ledger and our write of the cache isn't clobbered.
+	if _, err := tx.Exec(ctx, `LOCK TABLE merchant_balances IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		return nil, fmt.Errorf("ledger: RebuildAllBalances: lock: %w", err)
+	}
 	diffs := make(map[uuid.UUID]RebuildDiff, len(merchantIDs))
 
 	for _, merchantID := range merchantIDs {

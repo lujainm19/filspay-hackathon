@@ -46,3 +46,11 @@ finance could reproduce in a spreadsheet.
 >
 > **MK:** noted. Keeping it for monthly reports, revisit if a month doesn't
 > tie.
+
+
+## Superseded (Oct 2026 review)
+
+YA was right: the three hours do not "net out", they belong to a different
+month, and March never tied because of it. All windows — daily and monthly —
+use the Asia/Bahrain business day. `scripts/reconcile_march.ts` now uses the
+Bahrain month.

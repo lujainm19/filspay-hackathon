@@ -10,6 +10,7 @@ import { ApiError, describeError } from "../../api/client.js";
 import { RequireRole } from "../../auth/RequireRole.js";
 import { bhd, dash, dateTime } from "../../format.js";
 import type { TransactionDto, TransactionEventDto } from "../../types.js";
+import { RefundDrawer } from "./RefundDrawer.js";
 
 type LoadState =
   | { kind: "loading" }
@@ -27,7 +28,7 @@ type LoadState =
  * this page does not undo that by guessing.
  */
 // MK: timeline renders refund events fine
-// FH: RefundDrawer import removed 2026-06 until the route exists
+// RefundDrawer posts to POST /v1/merchants/:id/refunds (FP-212/FP-300 API route, Lujain's branch).
 export function TransactionDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [state, setState] = useState<LoadState>({ kind: "loading" });
@@ -165,12 +166,10 @@ export function TransactionDetailPage() {
         <dd>{dateTime(txn.createdAt)}</dd>
       </dl>
 
-      {/* Capture and void are hidden from `support` as a UX choice — a support
-          agent looks things up, they don't move money. Unlike the
-          reconciliation page, this hide is NOT backed by a matching
-          server-side role check: the API gates capture/void at "any
-          authenticated merchant actor". Do not mistake a hidden button here for a security
-          boundary. */}
+      {/* Capture, void and refund are hidden from `support`. A hidden button
+          is not a security boundary: the API must enforce owner/finance on
+          capture/void/refund (Lujain's API branch). */}
+      <RefundDrawer txn={txn} onRefunded={load} />
       <RequireRole allow={["owner", "finance"]}>
         {capturable || voidable ? (
           <div className="dash-actions">

@@ -308,3 +308,10 @@
   min-width: 1px;
   background: #4a7ebb;
 }
+
+.dash-success {
+  color: #166534;
+  background: #dcfce7;
+  border-radius: 6px;
+  padding: 8px 12px;
+}

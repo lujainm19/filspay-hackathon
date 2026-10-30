@@ -1,0 +1,42 @@
+# SITE_ADDRESS / ADMIN_ADDRESS: a domain (e.g. pay.example.com) gets automatic
+# HTTPS; ":80" / ":8080" serve plain HTTP for a quick IP-only demo.
+(common) {
+	encode gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+	handle /v1/* {
+		reverse_proxy api:3000 {
+			# Fail fast when the API is shedding/restarting instead of queueing.
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 30s
+			}
+		}
+	}
+	handle /healthz* {
+		reverse_proxy api:3000
+	}
+}
+
+{$SITE_ADDRESS::80} {
+	import common
+	handle {
+		root * /srv/web
+		try_files {path} /index.html
+		file_server
+	}
+}
+
+{$ADMIN_ADDRESS::8080} {
+	import common
+	handle {
+		root * /srv/admin
+		try_files {path} /index.html
+		file_server
+	}
+}

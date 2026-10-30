@@ -8,7 +8,7 @@ three roles:
 |---|---|
 | **support** | look things up, replay webhooks, view as a merchant, issue small credits |
 | **finance** | everything support can do, plus anything that touches money or settlement |
-| **super_admin** | everything, including making changes while viewing as a merchant |
+| **super_admin** | everything in the console. "View as merchant" is read-only for every role. |
 
 You'll only see the buttons your role can use. Everything you do here is
 written to the admin audit log.
@@ -40,7 +40,9 @@ merchant through the usual secure channel.
 
 **Recompute transaction statuses** — tidies up transaction statuses for
 merchants whose refunds were processed before the refunds release (the
-manual refunds finance did over email in Q1). Safe to run more than once.
+manual refunds finance did over email in Q1). Safe to run more than once. It
+no longer touches the merchant's test-mode flag (it used to clear it, which
+put the test merchant Gamma into the real settlement run).
 
 ## Money
 
@@ -66,7 +68,7 @@ reconciliation match what finance agreed with them.
 `merchantId,amount,reason` header. Amounts are in BD as finance's sheets
 already have them (`4.75`, `120.00`). Rows are applied as soon as you
 submit; each import's rows are kept with the original text for reference.
-Don't submit the same file twice; there's no duplicate detection yet.
+Submitting the exact same file twice is refused (content hash).
 
 ## Settlement ops
 
@@ -86,7 +88,7 @@ waiting for the worker. Quick, safe, and repeatable.
 
 ## Webhooks
 
-> **— unsigned:** replay-batch reuses the original delivery ids, so receivers dedupe fine.
+> Replays keep the original `Webhook-Delivery-Id`, so receivers dedupe them.
 
 **Replay a batch** — pick an endpoint, a date range, and which delivery
 statuses to resend (default: `exhausted`; any status can be chosen). Each
@@ -97,15 +99,15 @@ deliveries.
 archive the endpoint's history; after they register the new one, restore
 the archive against it to backfill. No screen for this yet — it's
 `POST /v1/admin/merchants/:id/webhook-endpoints/:endpointId/archive` and
-`.../archive/:archiveId/replay`. Archives are written in pages of 1000
-deliveries, so any range is fine.
+`.../archive/:archiveId/replay`. An archive holds at most 5,000 deliveries;
+for more, archive several shorter ranges.
 
 ## Incident review: duplicate `settlement.paid` (2026-08-21)
 
 | | |
 |---|---|
 | Impact | Two merchants received `settlement.paid` twice for the 20 Aug batch; two disbursement records each |
-| Root cause | Reporting worker restarted at 03:01 and replayed NOTIFYs, waking the dispatcher twice for the same outbox rows |
+| Root cause | (corrected) daemon and CLI both ran `EnqueuePayoutNotifications`; its NOT EXISTS check-then-insert raced and inserted two outbox events (hence AM's "different outbox event ids"). Disbursements were recorded per webhook attempt. Fixed: unique index + ON CONFLICT; disbursement recorded once at payout. |
 | Why it wasn't caught | Receivers are expected to dedupe on `Webhook-Delivery-Id` |
 | Actions | NOTIFY debounce in apps/reporting (FP-251); ask merchants to dedupe (done) |
 

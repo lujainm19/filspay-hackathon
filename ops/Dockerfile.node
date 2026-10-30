@@ -1,0 +1,21 @@
+# Image for apps/api, apps/reporting and the migrate/seed jobs.
+# (These Dockerfiles were referenced by compose but never committed.)
+FROM node:22-slim AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY packages/money/package.json packages/money/
+COPY packages/events/package.json packages/events/
+COPY apps/api/package.json apps/api/
+COPY apps/reporting/package.json apps/reporting/
+COPY apps/web/package.json apps/web/
+COPY apps/admin/package.json apps/admin/
+RUN npm ci --no-audit --no-fund && npm cache clean --force
+
+FROM node:22-slim
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+# Run as an unprivileged user; KYC uploads go to a mounted volume.
+RUN mkdir -p /app/data/kyc && chown -R node:node /app/data
+USER node

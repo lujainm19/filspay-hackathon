@@ -237,11 +237,13 @@ export interface RecomputeStatusesResult {
   flagsUpdated: string[];
 }
 
-/** `POST /v1/admin/reporting/rebuild` → `200 { volumeRows, trendRows }` —
- *  how many rows each of the two analytics rollup tables ended up with. */
+/** `POST /v1/admin/reporting/rebuild` → rollups reset; the reporting worker
+ *  replays `eventsToReplay` outbox events to rebuild them (A6). */
 export interface AnalyticsRebuildSummary {
   volumeRows: number;
   trendRows: number;
+  eventsToReplay?: number;
+  replayQueued?: boolean;
 }
 
 // ---------------------------------------------------------------------------

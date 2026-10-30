@@ -158,3 +158,21 @@ callback ids.
 >
 > **MK:** the retry window is also ~60 s. Same evidence fits both. Callback
 > dedupe is the fix we can verify; we've had no doubles since.
+
+
+## Correction (Oct 2026 review)
+
+The root cause above is wrong; AM's reviewer note was right. Callback
+deduplication never existed (no `processed_events`, no unique key — FP-201 was
+reopened), and the evidence (one callback note per transaction, every double
+had a first attempt > 60 s, three captures on FP-PL-8853, FP-PL-8902 created
+*after* the "fix") points at `pay.ts`: a reservation older than the 60 s
+timeout could be re-claimed while the first payer's capture was still running,
+and the late finalize matched 0 rows but still answered 200. The "AI review"
+that cleared `pay.ts` only looked at the claim UPDATE, not at what happens
+after the reservation expires.
+
+Fixed: per-claim `reservation_id`, a link whose capture has started can't be
+re-claimed, finalize only matches its own reservation, failed captures void
+their authorization, and a recovery job resolves links left mid-capture by a
+crash. Callbacks are now deduplicated on (callback_id, transaction_id).

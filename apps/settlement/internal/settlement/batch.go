@@ -59,7 +59,7 @@ type eligibleEvent struct {
 // so a row can never be picked up by two batches.
 func CloseBatch(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, businessDate time.Time) (BatchResult, error) {
 	start, end := BusinessDayWindow(businessDate)
-	batchDateOnly := time.Date(businessDate.Year(), businessDate.Month(), businessDate.Day(), 0, 0, 0, 0, time.UTC)
+	batchDateOnly := BusinessDate(businessDate)
 
 	tx, err := db.Begin(ctx)
 	if err != nil {
@@ -134,6 +134,10 @@ func CloseBatch(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, bus
 	}
 
 	// Platform-wide volume-tier bonus — read and locked once per batch.
+	// The counter is int64 now (it was int32 and wrapped negative past
+	// ~2,147,483 BD, which turned the bonus off — or worse — exactly when
+	// the tier was reached). TEAM DECISION: whether finance ever approved
+	// the tier is open (see FINDINGS "chose differently").
 	platformProcessedFils, err := ReadAndLockPlatformProcessedFils(ctx, tx)
 	if err != nil {
 		return BatchResult{}, fmt.Errorf("settlement: CloseBatch: read platform volume: %w", err)
@@ -216,7 +220,42 @@ func CloseBatch(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, bus
 		batchGross += grossForTxn
 		batchFee += feeForTxn
 	}
-	netPayout := NetPayableFils(batchGross, batchFee)
+	// Refunds (FP-212). Refunds already moved money back to cardholders and
+	// were debited from merchant_payable in the ledger, but batches never
+	// looked at them, so the merchant was still paid the full net. Claim this
+	// day's unbatched refunds and net them out of the payout.
+	var refundNet money.Fils
+	refundRows, err := tx.Query(ctx, `
+		SELECT id, amount_fils, fee_reversed_fils FROM refunds
+		 WHERE merchant_id = $1 AND status = 'succeeded' AND settlement_batch_id IS NULL
+		   AND occurred_at < $2
+		 FOR UPDATE
+	`, merchantID, end)
+	if err != nil {
+		return BatchResult{}, fmt.Errorf("settlement: CloseBatch: select refunds: %w", err)
+	}
+	var refundIDs []uuid.UUID
+	for refundRows.Next() {
+		var id uuid.UUID
+		var amount, feeReversed int64
+		if err := refundRows.Scan(&id, &amount, &feeReversed); err != nil {
+			refundRows.Close()
+			return BatchResult{}, fmt.Errorf("settlement: CloseBatch: scan refund: %w", err)
+		}
+		refundNet += money.Fils(amount - feeReversed)
+		refundIDs = append(refundIDs, id)
+	}
+	refundRows.Close()
+	if err := refundRows.Err(); err != nil {
+		return BatchResult{}, fmt.Errorf("settlement: CloseBatch: iterate refunds: %w", err)
+	}
+	if len(refundIDs) > 0 {
+		if _, err := tx.Exec(ctx, `UPDATE refunds SET settlement_batch_id = $2 WHERE id = ANY($1)`, refundIDs, batchID); err != nil {
+			return BatchResult{}, fmt.Errorf("settlement: CloseBatch: claim refunds: %w", err)
+		}
+	}
+
+	netPayout := NetPayableFils(batchGross, batchFee) - refundNet
 
 	// Record this batch's contribution to the platform-wide lifetime
 	// processed-volume counter, in the same transaction that freezes this
@@ -251,10 +290,28 @@ func CloseBatch(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, bus
 		truncated := TruncateToSchemeAmount(line.grossFils)
 		_, err = tx.Exec(ctx, `
 			INSERT INTO scheme_export_lines (settlement_batch_id, transaction_id, amount_fils, amount, line_sequence)
-			VALUES ($1, $2, $3, $4, $5)
+			VALUES ($1, $2, $3, $4::numeric, $5)
 		`, batchID, line.transactionID, int64(truncated), SchemeAmountBD(line.grossFils), i+1)
 		if err != nil {
 			return BatchResult{}, fmt.Errorf("settlement: CloseBatch: insert scheme export line: %w", err)
+		}
+
+		// ADR-0002, option A: journal the 0-9 fils the scheme will never pay
+		// into the suspense account, per line, in the same transaction. The
+		// ADR says this was implemented in CloseBatch in March 2026; it never
+		// was (handover: "nothing posts residue yet"), which is why finance
+		// had to run monthly sweep scripts.
+		if residue := line.grossFils - truncated; residue > 0 {
+			_, err = tx.Exec(ctx, `
+				INSERT INTO ledger_entries
+				  (entry_group_id, merchant_id, transaction_id, settlement_batch_id, account_id, direction, amount_fils, occurred_at, description)
+				VALUES
+				  ($1, $2, $3, $4, 'scheme_rounding_residue', 'debit',  $5, now(), 'scheme rounding residue'),
+				  ($1, $2, $3, $4, 'card_scheme_clearing',    'credit', $5, now(), 'scheme rounding residue')
+			`, uuid.New(), merchantID, line.transactionID, batchID, int64(residue))
+			if err != nil {
+				return BatchResult{}, fmt.Errorf("settlement: CloseBatch: post scheme residue: %w", err)
+			}
 		}
 	}
 
@@ -349,6 +406,13 @@ func PayoutBatch(ctx context.Context, db *pgxpool.Pool, batchID uuid.UUID) (Payo
 	// is a no-op, and keeping the running total's every update in lockstep
 	// with every processed batch — rather than skipping zero-value ones —
 	// keeps its own bookkeeping simple.
+	// One disbursement record per paid batch, written here with the payout
+	// itself. It used to be a side effect of the settlement.paid *webhook*
+	// (once per endpoint, again on replay, never without an endpoint).
+	if err := RecordDisbursement(ctx, tx, batchID, money.Fils(netPayout)); err != nil {
+		return PayoutResult{}, fmt.Errorf("settlement: PayoutBatch: record disbursement: %w", err)
+	}
+
 	if err := UpdateLifetimePayoutMonitoringEstimate(ctx, tx, merchantID, money.Fils(netPayout)); err != nil {
 		return PayoutResult{}, fmt.Errorf("settlement: PayoutBatch: update lifetime payout monitoring estimate: %w", err)
 	}
@@ -475,4 +539,18 @@ func RunDailyBatch(ctx context.Context, db *pgxpool.Pool, businessDate time.Time
 	}
 
 	return report, nil
+}
+
+// RecordDisbursement writes the batch's single disbursement instruction.
+// Idempotent (unique on settlement_batch_id, migration 0073).
+func RecordDisbursement(ctx context.Context, tx pgx.Tx, batchID uuid.UUID, netPayout money.Fils) error {
+	if netPayout <= 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO settlement_payout_disbursements (settlement_batch_id, amount_fils, disbursement_reference)
+		VALUES ($1, $2, 'disb_' || gen_random_uuid())
+		ON CONFLICT (settlement_batch_id) DO NOTHING
+	`, batchID, int64(netPayout))
+	return err
 }

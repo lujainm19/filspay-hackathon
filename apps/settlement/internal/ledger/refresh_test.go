@@ -33,11 +33,29 @@ func insertClosedBatchWithLine(t *testing.T, pool *pgxpool.Pool, merchantID uuid
 	return batchID
 }
 
+// insertPayableCredit posts a balanced capture-style group: the merchant is
+// owed amountFils.
+func insertPayableCredit(t *testing.T, pool *pgxpool.Pool, merchantID uuid.UUID, amountFils int64) {
+	t.Helper()
+	_, err := pool.Exec(context.Background(), `
+		INSERT INTO ledger_entries (entry_group_id, merchant_id, account_id, direction, amount_fils, occurred_at, description)
+		VALUES ($1, $2, 'card_scheme_clearing', 'debit',  $3, now(), 'test capture'),
+		       ($1, $2, 'merchant_payable',     'credit', $3, now(), 'test capture')
+	`, uuid.New(), merchantID, amountFils)
+	if err != nil {
+		t.Fatalf("insertPayableCredit: %v", err)
+	}
+}
+
+// Updated (hackathon review, FP-203): the console's "Rebuild cached balances"
+// must give the same figure as the CLI, i.e. the merchant_payable ledger
+// balance. These tests used to assert it equals the sum of scheme export
+// lines — the bug that turned Alpha Retail's 135K into 7K.
 func TestRefreshBalanceCache_OverwritesDriftedCache(t *testing.T) {
 	pool := mustPool(t)
 	merchantID := insertActiveMerchant(t, pool)
 
-	insertClosedBatchWithLine(t, pool, merchantID, "2026-06-10", 25000, 1)
+	insertPayableCredit(t, pool, merchantID, 25000)
 	want := int64(25000)
 
 	_, err := pool.Exec(context.Background(), `
@@ -81,8 +99,8 @@ func TestRefreshBalanceCache_SumsAcrossBatches(t *testing.T) {
 	pool := mustPool(t)
 	merchantID := insertActiveMerchant(t, pool)
 
-	insertClosedBatchWithLine(t, pool, merchantID, "2026-06-11", 15000, 1)
-	insertClosedBatchWithLine(t, pool, merchantID, "2026-06-12", 6000, 1)
+	insertPayableCredit(t, pool, merchantID, 15000)
+	insertPayableCredit(t, pool, merchantID, 6000)
 
 	want := int64(15000 + 6000)
 
@@ -97,5 +115,28 @@ func TestRefreshBalanceCache_SumsAcrossBatches(t *testing.T) {
 	}
 	if int64(diff.Rebuilt) != want {
 		t.Errorf("diff.Rebuilt = %d, want %d", diff.Rebuilt, want)
+	}
+}
+
+// FP-203 regression: scheme export lines are not a balance. A merchant with
+// 135,000 fils owed in the ledger and only 7,000 fils of exported lines must
+// rebuild to 135,000.
+func TestRefreshBalanceCache_FollowsLedgerNotSchemeLines(t *testing.T) {
+	pool := mustPool(t)
+	merchantID := insertActiveMerchant(t, pool)
+
+	insertPayableCredit(t, pool, merchantID, 135000)
+	insertClosedBatchWithLine(t, pool, merchantID, "2026-06-13", 7000, 1)
+
+	diffs, err := RefreshBalanceCache(context.Background(), pool)
+	if err != nil {
+		t.Fatalf("RefreshBalanceCache: %v", err)
+	}
+	cli, err := RebuildMerchantBalance(context.Background(), pool, merchantID)
+	if err != nil {
+		t.Fatalf("RebuildMerchantBalance: %v", err)
+	}
+	if diffs[merchantID].Rebuilt != 135000 || cli != 135000 {
+		t.Fatalf("button=%d cli=%d, want both 135000", diffs[merchantID].Rebuilt, cli)
 	}
 }

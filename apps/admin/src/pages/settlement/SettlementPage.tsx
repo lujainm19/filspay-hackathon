@@ -322,11 +322,18 @@ export function SettlementPage() {
 
       {analyticsResult ? (
         <div className="admin-notice">
-          <p>
-            Rebuilt {analyticsResult.volumeRows} daily-volume row
-            {analyticsResult.volumeRows === 1 ? "" : "s"} and {analyticsResult.trendRows} payout-trend
-            row{analyticsResult.trendRows === 1 ? "" : "s"}.
-          </p>
+          {analyticsResult.replayQueued ? (
+            <p>
+              Analytics reset. The reporting worker is replaying {analyticsResult.eventsToReplay ?? 0} event
+              {analyticsResult.eventsToReplay === 1 ? "" : "s"}; dashboards fill back in over the next minute.
+            </p>
+          ) : (
+            <p>
+              Rebuilt {analyticsResult.volumeRows} daily-volume row
+              {analyticsResult.volumeRows === 1 ? "" : "s"} and {analyticsResult.trendRows} payout-trend
+              row{analyticsResult.trendRows === 1 ? "" : "s"}.
+            </p>
+          )}
         </div>
       ) : null}
 

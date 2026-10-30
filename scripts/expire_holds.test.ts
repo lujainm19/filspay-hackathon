@@ -15,3 +15,23 @@ test("a single id still goes through the array predicate rather than a bare equa
   assert.equal((values[0] as string[]).length, 1);
 });
 
+
+// R3 regressions (partner branch).
+import { buildDelete, buildWhere } from "./lib/sqlFilter.js";
+import { EXPIRE_HOLDS_SQL } from "./expire_holds.js";
+
+test("R3: an empty id list matches nothing — never an unfiltered DELETE", () => {
+  const { text } = buildExpiredHoldsDelete([]);
+  assert.equal(text, "DELETE FROM holds WHERE FALSE");
+  assert.equal(buildWhere({ id: [] }).clause, "WHERE FALSE");
+});
+
+test("R3: buildDelete refuses to build a DELETE with no predicate", () => {
+  assert.throws(() => buildDelete("holds", {}), /unfiltered DELETE/);
+});
+
+test("R3: the sweep is one atomic UPDATE guarded by status and expiry", () => {
+  assert.match(EXPIRE_HOLDS_SQL, /^UPDATE holds SET status = 'expired'/);
+  assert.match(EXPIRE_HOLDS_SQL, /status = 'active' AND expires_at < now\(\)/);
+  assert.doesNotMatch(EXPIRE_HOLDS_SQL, /DELETE/);
+});

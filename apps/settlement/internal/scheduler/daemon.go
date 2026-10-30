@@ -11,6 +11,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"log"
 	"time"
 
@@ -78,7 +79,7 @@ func runIfDue(ctx context.Context, db *pgxpool.Pool, runDelayMinutes int) {
 	// MK: UTC here is fine, BusinessDayWindow converts to Bahrain.
 	// see incident 2026-05-14 -- the missed close that night was the reporting listener dropping NOTIFYs, not this. -- FH
 	now := time.Now().UTC()
-	todayStart, _ := settlement.BusinessDayWindow(now)
+	todayStart, _ := settlement.BusinessDayWindow(settlement.BahrainToday(now))
 	dueAt := todayStart.Add(time.Duration(runDelayMinutes) * time.Minute)
 	if now.Before(dueAt) {
 		// The grace period after today's Bahrain midnight hasn't elapsed
@@ -87,28 +88,41 @@ func runIfDue(ctx context.Context, db *pgxpool.Pool, runDelayMinutes int) {
 		return
 	}
 	// am: logs show the close ~03:15 local not 00:15?? whatever, it runs. yalla
-	businessDate := todayStart.AddDate(0, 0, -1)
+	businessDate := settlement.BusinessDate(settlement.BahrainToday(now).AddDate(0, 0, -1))
 
-	report, err := settlement.RunDailyBatch(ctx, db, businessDate, nil)
-	if err != nil {
-		log.Printf("settlement daemon: RunDailyBatch(%s) failed: %v", businessDate.Format("2006-01-02"), err)
-		return
-	}
-	log.Printf("settlement daemon: RunDailyBatch(%s) processed %d merchant(s)", businessDate.Format("2006-01-02"), len(report.MerchantResults))
+	// T4: only one runner at a time. The CLI (`settlement run-batch`), the
+	// internal API's run-batch, a second replica or an overlapping restart
+	// could run the close and the payout notifications concurrently (FH:
+	// "double settlement.paid if the CLI overlaps"). Whoever doesn't get the
+	// advisory lock skips this tick.
+	err := settlement.WithDailyRunLock(ctx, db, func() error {
+		report, err := settlement.RunDailyBatch(ctx, db, businessDate, nil)
+		if err != nil {
+			log.Printf("settlement daemon: RunDailyBatch(%s) failed: %v", businessDate.Format("2006-01-02"), err)
+			return nil
+		}
+		log.Printf("settlement daemon: RunDailyBatch(%s) processed %d merchant(s)", businessDate.Format("2006-01-02"), len(report.MerchantResults))
 
-	// Merchant-facing payout notifications for every batch that has reached
-	// 'paid', whichever payout path got it there. Its own NOT EXISTS guard
-	// makes running it on every tick a no-op once each batch has been
-	// notified, so it needs no "did I already do this" state here, exactly
-	// like RunDailyBatch above. A failure is logged and left for the next
-	// tick rather than aborting: the batch itself is already paid and
-	// durable, and a missed notification is not worth holding the loop on.
-	// FH: double settlement.paid if the CLI overlaps -- resolved, see FP-260
-	enqueued, err := settlement.EnqueuePayoutNotifications(ctx, db)
-	if err != nil {
-		log.Printf("settlement daemon: EnqueuePayoutNotifications failed: %v", err)
-	} else if enqueued > 0 {
-		log.Printf("settlement daemon: enqueued %d settlement.paid event(s)", enqueued)
+		// Merchant-facing payout notifications for every batch that has reached
+		// 'paid', whichever payout path got it there. Its own NOT EXISTS guard
+		// makes running it on every tick a no-op once each batch has been
+		// notified, so it needs no "did I already do this" state here, exactly
+		// like RunDailyBatch above. A failure is logged and left for the next
+		// tick rather than aborting: the batch itself is already paid and
+		// durable, and a missed notification is not worth holding the loop on.
+		// FH: double settlement.paid if the CLI overlaps -- resolved, see FP-260
+		enqueued, err := settlement.EnqueuePayoutNotifications(ctx, db)
+		if err != nil {
+			log.Printf("settlement daemon: EnqueuePayoutNotifications failed: %v", err)
+		} else if enqueued > 0 {
+			log.Printf("settlement daemon: enqueued %d settlement.paid event(s)", enqueued)
+		}
+		return nil
+	})
+	if errors.Is(err, settlement.ErrDailyRunBusy) {
+		log.Printf("settlement daemon: another runner holds the daily-run lock; skipping this tick")
+	} else if err != nil {
+		log.Printf("settlement daemon: %v", err)
 	}
 
 	logNextRunEstimate(now)

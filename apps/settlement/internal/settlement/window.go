@@ -10,22 +10,9 @@ import (
 )
 
 // businessDayLocation is the settlement business day's fixed timezone:
-// Asia/Bahrain local time (UTC+3, no DST — Bahrain has observed no
-// daylight-saving transitions since 1972), loaded as a named IANA zone and
-// held in an unexported package var, never read from configuration.
-//
-// Why hardcoded rather than configurable: FilsPay settles Bahraini Dinar;
-// the merchants and the card-scheme relationship this platform models are
-// Bahrain-based. A "settlement business day" has to close at this
-// platform's local midnight, not the host machine's or the deploying
-// engineer's. There is exactly one place this value is defined, and no
-// config or TZ variable can change it.
-//
-// — YA: it's Asia/Bahrain.
+// Asia/Bahrain (UTC+3, no DST since 1972).
 var businessDayLocation = mustLoadLocation("Asia/Bahrain")
 
-// mustLoadLocation panics at package init if the zone cannot be loaded.
-// cmd/settlement imports time/tzdata, so it cannot fail in the shipped binary.
 func mustLoadLocation(name string) *time.Location {
 	loc, err := time.LoadLocation(name)
 	if err != nil {
@@ -34,16 +21,32 @@ func mustLoadLocation(name string) *time.Location {
 	return loc
 }
 
-// BusinessDayWindow returns the [start, end) UTC instants bounding the
-// given calendar date's Asia/Bahrain business day, i.e. Asia/Bahrain
-// 00:00:00 on `date` through Asia/Bahrain 00:00:00 on `date`+1.
-// am (oct 2): pretty sure this is an hour off in summer, bahrain does DST? we saw a gap in sept
-// nvm. no DST since 1972, see above
-func BusinessDayWindow(date time.Time) (start, end time.Time) {
-	// FH: date.Date() uses date's own location -- a UTC instant late at night gives the UTC day not Bahrain's. claude says this is a bug in BusinessDayWindow
+// BusinessDate normalizes a business *date* (only its calendar Y/M/D, as
+// given, matter) to the UTC-midnight form batch_date is stored in.
+func BusinessDate(date time.Time) time.Time {
 	y, m, d := date.Date()
-	start = time.Date(y, m, d, 0, 0, 0, 0, businessDayLocation)
-	// MK: AddDate not Add(24h). leave
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
+// BahrainToday returns today's Asia/Bahrain calendar date for an instant.
+//
+// Finance memo: "the daily close is running at 3am local, not midnight".
+// The daemon passed time.Now().UTC() straight into BusinessDayWindow, which
+// reads the calendar date *as given* — the UTC date. Between 00:00 and 03:00
+// Bahrain the UTC date is still yesterday, so "today's" start was a day
+// early, the due check didn't fire, and the close only ran once the UTC date
+// flipped (03:00 + 15 min delay = ~03:15 local). Converting the instant to
+// Bahrain time first fixes it.
+func BahrainToday(now time.Time) time.Time {
+	return BusinessDate(now.In(businessDayLocation))
+}
+
+// BusinessDayWindow returns the [start, end) instants bounding the given
+// business date's Asia/Bahrain day: Bahrain 00:00 on that date through
+// Bahrain 00:00 the next day.
+func BusinessDayWindow(date time.Time) (start, end time.Time) {
+	bd := BusinessDate(date)
+	start = time.Date(bd.Year(), bd.Month(), bd.Day(), 0, 0, 0, 0, businessDayLocation)
 	end = start.AddDate(0, 0, 1)
 	return start, end
 }

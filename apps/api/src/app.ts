@@ -39,12 +39,36 @@ export interface BuildAppOptions {
  * tests use `app.inject(...)` against this — no real socket needed.
  */
 export function buildApp(config: Config, pool: Pool, options: BuildAppOptions = {}): FastifyInstance {
-  const app = Fastify({ logger: true });
+  // LOG_LEVEL is honoured (it was ignored: every request was logged at info,
+  // which costs real CPU on a 0.5 vCPU container under load).
+  const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
 
   app.decorate("db", pool);
   app.decorate("config", config);
   app.decorate("acquirer", createAcquirerSimulator(config));
   app.decorate("webhookTransport", options.webhookTransport ?? createFetchTransport());
+
+  // Load shedding (capacity test: "push past your limit and see whether your
+  // stack turns away the excess"). When the DB pool already has a queue of
+  // waiters, a new request would only wait, time out after 5 s and hold
+  // memory doing it. Answer 503 + Retry-After immediately instead, so the
+  // requests we *do* accept stay fast and the 512 MB container never
+  // accumulates an unbounded backlog. Health routes are never shed.
+  const maxPoolWaiters = config.maxPoolWaiters;
+  const maxInFlight = config.maxInFlightRequests;
+  let inFlight = 0;
+  app.addHook("onRequest", async (request, reply) => {
+    if (request.url.startsWith("/healthz") || request.url.startsWith("/readyz")) return;
+    if (inFlight >= maxInFlight || pool.waitingCount > maxPoolWaiters) {
+      reply.header("Retry-After", "1").code(503).send({ error: "overloaded", message: "server busy, retry shortly" });
+      return reply;
+    }
+    inFlight += 1;
+    (request as unknown as { counted?: boolean }).counted = true;
+  });
+  app.addHook("onResponse", async (request) => {
+    if ((request as unknown as { counted?: boolean }).counted) inFlight -= 1;
+  });
 
   app.register(cookiesPlugin);
   app.register(multipartPlugin, { config });

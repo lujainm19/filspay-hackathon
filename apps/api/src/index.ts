@@ -5,6 +5,7 @@ import { markDbConnectedOnce } from "./health/state.js";
 import { formatIsoDate } from "./lib/dateFormat.js";
 import { startWebhookDispatcher, type WebhookDispatcherHandle } from "./webhooks/dispatcher.js";
 import { createFetchTransport } from "./webhooks/transport.js";
+import { recoverStuckPaymentLinks } from "./paymentLinks/pay.js";
 
 async function main(): Promise<void> {
   const config = loadConfig(process.env);
@@ -29,6 +30,19 @@ async function main(): Promise<void> {
   // MK: one dispatcher per replica. SKIP LOCKED in the claim query makes multiple replicas safe
   // am: we only run one replica anyway (512mb). fine
   const dispatcher: WebhookDispatcherHandle = startWebhookDispatcher(pool, webhookTransport, config);
+
+  // Resolve payment links a crash left mid-capture (on boot, then every
+  // minute). The capture path itself is bounded well under 2 minutes.
+  const recoverLinks = (): void => {
+    recoverStuckPaymentLinks(pool, 120)
+      .then((n) => {
+        if (n > 0) console.log(`[index] recovered ${n} payment link(s) left mid-capture`);
+      })
+      .catch((err: unknown) => console.error("[index] payment link recovery failed", err));
+  };
+  recoverLinks();
+  const recoveryTimer = setInterval(recoverLinks, 60_000);
+  recoveryTimer.unref();
 
   let shuttingDown = false;
   /**
