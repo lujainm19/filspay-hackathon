@@ -150,7 +150,11 @@ function parseBoolEnv(value: string | undefined, fallback: boolean): boolean {
   return value === "true" || value === "1";
 }
 
-const DEV_FALLBACK_WEBHOOK_KEY_B64 = "dGVzdC1rZXktZm9yLWRldi1vbmx5LW5vdC1mb3ItcHJvZA==";
+// Was "test-key-for-dev-only-not-for-prod", which is 34 bytes, not the 32 that
+// AES-256 needs, so the API refused to boot in dev without a real key (the
+// ops README note). This one decodes to exactly 32 bytes. Dev only — production
+// still has to set WEBHOOK_SECRET_ENCRYPTION_KEY.
+const DEV_FALLBACK_WEBHOOK_KEY_B64 = "ZGV2LW9ubHkta2V5LWRvLW5vdC11c2UtaW4tcHJvZCE=";
 
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
@@ -209,7 +213,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     otpTtlMinutes: parseIntEnv(env.OTP_TTL_MINUTES, 5),
     otpCodeLength: parseIntEnv(env.OTP_CODE_LENGTH, 6),
     otpMaxAttempts: parseIntEnv(env.OTP_MAX_ATTEMPTS, 5),
-    otpDevExpose: parseBoolEnv(env.OTP_DEV_EXPOSE, nodeEnv !== "production"),
+    // S5 fix: what was wrong — this defaulted to ON unless NODE_ENV was exactly
+    // "production". Why — compose never loads ops/.env.docker, so NODE_ENV is
+    // unset on the hosted box. What it broke — the login response carried the
+    // OTP code itself, so the second factor was handed to whoever typed the
+    // password. Now it is OFF unless someone explicitly sets OTP_DEV_EXPOSE=true.
+    otpDevExpose: parseBoolEnv(env.OTP_DEV_EXPOSE, false),
 
     argon2MemoryKib: parseIntEnv(env.ARGON2_MEMORY_KIB, 19_456),
     argon2TimeCost: parseIntEnv(env.ARGON2_TIME_COST, 2),
@@ -256,6 +265,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     webhookRequestTimeoutMs: parseIntEnv(env.WEBHOOK_REQUEST_TIMEOUT_MS, 10_000),
 
     acquirerCallbackSigningSecret,
-    acquirerCallbackRequireSignature: parseBoolEnv(env.ACQUIRER_CALLBACK_REQUIRE_SIGNATURE, false),
+    // S11 fix: an unsigned callback used to be accepted unless this was turned
+    // on, and it was off by default — so anyone could post fake fraud verdicts.
+    // Now a signature is required unless someone deliberately turns it off.
+    acquirerCallbackRequireSignature: parseBoolEnv(env.ACQUIRER_CALLBACK_REQUIRE_SIGNATURE, true),
   };
 }
