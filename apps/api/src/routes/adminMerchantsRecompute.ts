@@ -2,7 +2,6 @@ import type { FastifyInstance } from "fastify";
 import { requireAdminRole, requireAdminSession } from "../adminAuth/middleware.js";
 import { insertAdminAuditLog } from "../adminAudit/log.js";
 import { merchantExists, UUID_RE } from "../admin/merchants.js";
-import { reconcileSandboxFlag } from "../admin/merchantFlags.js";
 import { recomputeTransactionStatusesForMerchant } from "../admin/transactionStatusRecompute.js";
 import { withTransaction } from "../db/withTransaction.js";
 import { NotFoundError, UnauthorizedError } from "../lib/errors.js";
@@ -25,7 +24,14 @@ export async function adminMerchantsRecomputeRoutes(app: FastifyInstance): Promi
 
       const result = await withTransaction(app.db, async (client) => {
         const recompute = await recomputeTransactionStatusesForMerchant(client, request.params.id);
-        const flagsUpdated = await reconcileSandboxFlag(client, request.params.id, recompute);
+        // T3 fix: what was wrong — this also cleared merchants.test_mode
+        // whenever the merchant had no open authorizations. Why it matters —
+        // the settlement run only leaves out test_mode merchants. What it
+        // broke — running "Recompute" on the sandbox merchant Gamma put its
+        // fake sales into the real settlement run. Tidying statuses has no
+        // business changing whether a merchant is live, so it no longer
+        // touches any flag (flagsUpdated stays in the response, always empty).
+        const flagsUpdated: string[] = [];
         await insertAdminAuditLog(client, {
           adminUserId: adminAuth.adminUserId,
           action: "transaction_status_recompute",
