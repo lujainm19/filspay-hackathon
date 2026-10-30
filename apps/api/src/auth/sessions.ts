@@ -47,17 +47,34 @@ export async function createPendingSession(
   return { id: row.id, rawToken, expiresAt };
 }
 
-/** Promotes a pending session to authenticated. */
+/**
+ * Promotes a pending session to authenticated.
+ *
+ * S16 fix: what was wrong — the same cookie value was kept from the password
+ * step through to "fully logged in". Why — promote only flipped the flag.
+ * What it broke — anyone who got hold of the pre-OTP cookie (session fixation)
+ * ended up holding a full session once the real user typed the OTP. Pass
+ * `newRawToken` and we swap the stored hash, so the old cookie stops working
+ * the moment the OTP is verified.
+ */
 export async function promoteSession(
   client: PoolClient,
   sessionId: string,
   sessionTtlHours: number,
+  newRawToken?: string,
 ): Promise<Date> {
   const expiresAt = new Date(Date.now() + sessionTtlHours * 3_600_000);
-  await client.query(
-    `UPDATE sessions SET authenticated = true, authenticated_at = now(), expires_at = $2 WHERE id = $1`,
-    [sessionId, expiresAt],
-  );
+  if (newRawToken) {
+    await client.query(
+      `UPDATE sessions SET authenticated = true, authenticated_at = now(), expires_at = $2, token_hash = $3 WHERE id = $1`,
+      [sessionId, expiresAt, sha256Hex(newRawToken)],
+    );
+  } else {
+    await client.query(
+      `UPDATE sessions SET authenticated = true, authenticated_at = now(), expires_at = $2 WHERE id = $1`,
+      [sessionId, expiresAt],
+    );
+  }
   return expiresAt;
 }
 
@@ -74,7 +91,15 @@ export interface AuthenticatedSessionLookup {
   role: "owner" | "finance" | "support";
 }
 
-/** Resolves a session token to its user. */
+/**
+ * Resolves a session token to its user.
+ *
+ * S1 fix: what was wrong — this query never checked `authenticated = true`.
+ * Why — it reads the `live_sessions` view, which only hides revoked and
+ * expired rows, and the pending row from the password step is neither.
+ * What it broke — the cookie you get right after typing the password already
+ * worked on every merchant route, so the OTP protected nothing.
+ */
 export async function lookupSession(
   pool: Pool,
   rawToken: string,
@@ -89,7 +114,8 @@ export async function lookupSession(
     `SELECT s.id AS session_id, s.merchant_user_id, mu.merchant_id, mu.role
        FROM live_sessions s
        JOIN merchant_users mu ON mu.id = s.merchant_user_id
-      WHERE s.token_hash = $1`,
+      WHERE s.token_hash = $1
+        AND s.authenticated = true`,
     [tokenHash],
   );
   const row = result.rows[0];
