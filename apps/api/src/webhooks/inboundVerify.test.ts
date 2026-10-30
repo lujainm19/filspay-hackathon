@@ -12,7 +12,8 @@ const SECRET = "acqsec_test_secret";
 
 /** Builds the header the acquirer would send for a given payload — the same
  *  `t=<seconds>,v1=<hex>` shape webhooks/sign.ts uses outbound. */
-function acquirerHeader(payload: unknown, secret: string, timestamp = 1_757_930_000): string {
+// S11: signatures must be fresh now, so default to the current time.
+function acquirerHeader(payload: unknown, secret: string, timestamp = Math.floor(Date.now() / 1000)): string {
   const signature = createHmac("sha256", secret).update(`${timestamp}.${JSON.stringify(payload)}`).digest("hex");
   return `t=${timestamp},v1=${signature}`;
 }
@@ -50,4 +51,23 @@ test("an unsigned callback is accepted while signature checking is optional", ()
   const payload = { callbackId: "acqcb_1", outcome: "cleared" };
   const result = verifyAcquirerCallbackSignature(payload, undefined, SECRET);
   assert.deepEqual(result, { valid: true });
+});
+
+test("S11: a correctly-signed but stale callback (10 minutes old) is rejected", () => {
+  const payload = { callbackId: "acqcb_old", outcome: "cleared" };
+  const tenMinutesAgo = Math.floor(Date.now() / 1000) - 600;
+  const result = verifyAcquirerCallbackSignature(payload, acquirerHeader(payload, SECRET, tenMinutesAgo), SECRET, true);
+  assert.deepEqual(result, { valid: false, reason: "stale_timestamp" });
+});
+
+test("S11: with signatures required, a missing header is rejected", () => {
+  const result = verifyAcquirerCallbackSignature({ callbackId: "x" }, undefined, SECRET, true);
+  assert.equal(result.valid, false);
+});
+
+test("S11: the check runs over the exact raw body string that was sent", () => {
+  const raw = '{"outcome":"cleared","callbackId":"acqcb_raw"}';
+  const t = Math.floor(Date.now() / 1000);
+  const sig = createHmac("sha256", SECRET).update(`${t}.${raw}`).digest("hex");
+  assert.deepEqual(verifyAcquirerCallbackSignature(raw, `t=${t},v1=${sig}`, SECRET, true), { valid: true });
 });

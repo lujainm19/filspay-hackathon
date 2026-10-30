@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { timingSafeEqualHex } from "../lib/crypto.js";
 
 /** Verifies the signature on an inbound acquirer callback. */
 
@@ -29,25 +30,39 @@ function parseAcquirerSignatureHeader(header: string): ParsedAcquirerSignatureHe
   return { timestamp, signature };
 }
 
-/** There is no timestamp reason: freshness is not checked for inbound callbacks. */
-export type VerifyAcquirerCallbackFailureReason = "malformed_header" | "signature_mismatch";
+export type VerifyAcquirerCallbackFailureReason = "malformed_header" | "signature_mismatch" | "stale_timestamp";
 
 export interface VerifyAcquirerCallbackResult {
   valid: boolean;
   reason?: VerifyAcquirerCallbackFailureReason;
 }
 
-function constantTimeEquals(a: string, b: string): boolean {
-  return Buffer.from(a).length === Buffer.from(b).length &&
-    Buffer.compare(Buffer.from(a), Buffer.from(b)) === 0;
-}
-
-/** Verifies the acquirer callback signature when present and required. */
+/**
+ * Verifies the signature on an inbound acquirer callback.
+ *
+ * S11 fix (FP-240 "the incoming check has its own problems"). What was wrong,
+ * and why it mattered:
+ *  1. No header at all counted as valid unless a flag was on, and the flag was
+ *     off by default — so anyone could post a fake fraud verdict. The config
+ *     default is now "required" (config.ts).
+ *  2. The timestamp in the header was never checked, so a real callback
+ *     captured once could be replayed forever. Now it must be within 5 min.
+ *  3. The comparison used Buffer.compare, which stops at the first different
+ *     byte, so response timing leaked how much of a guess was right. Now it's
+ *     crypto.timingSafeEqual.
+ *  4. It signed JSON.stringify of the *parsed* body, which only matches the
+ *     acquirer's bytes if both sides happen to serialise identically. The route
+ *     now passes the raw body string, so we check exactly what was sent.
+ *
+ * `payload` is the raw request body string; an object is accepted for tests
+ * and is serialised with JSON.stringify.
+ */
 export function verifyAcquirerCallbackSignature(
   payload: unknown,
   header: string | undefined,
   secret: string,
   requireSignature = false,
+  options: { toleranceSeconds?: number; now?: number } = {},
 ): VerifyAcquirerCallbackResult {
   if (!header) {
     return requireSignature
@@ -58,12 +73,17 @@ export function verifyAcquirerCallbackSignature(
   const parsed = parseAcquirerSignatureHeader(header);
   if (!parsed) return { valid: false, reason: "malformed_header" };
 
-  const expected = createHmac("sha256", secret)
-    .update(`${parsed.timestamp}.${JSON.stringify(payload)}`)
-    .digest("hex");
+  const signedBody = typeof payload === "string" ? payload : JSON.stringify(payload);
+  const expected = createHmac("sha256", secret).update(`${parsed.timestamp}.${signedBody}`).digest("hex");
 
-  if (!constantTimeEquals(expected, parsed.signature)) {
+  if (!timingSafeEqualHex(expected, parsed.signature)) {
     return { valid: false, reason: "signature_mismatch" };
+  }
+
+  const now = options.now ?? Math.floor(Date.now() / 1000);
+  const tolerance = options.toleranceSeconds ?? 300;
+  if (Math.abs(now - parsed.timestamp) > tolerance) {
+    return { valid: false, reason: "stale_timestamp" };
   }
 
   return { valid: true };
