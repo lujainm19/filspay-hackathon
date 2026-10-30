@@ -238,19 +238,22 @@ test("R5: an archive range with too many deliveries is refused instead of loaded
   const adminUserId = await createAdminUser();
   const outbox = await pool.query<{ id: string }>(
     `INSERT INTO outbox_events (event_type, aggregate_type, aggregate_id, payload)
-     VALUES ('transaction.captured', 'transaction', gen_random_uuid(), '{}') RETURNING id`,
+     VALUES ('transaction.voided', 'transaction', gen_random_uuid(), jsonb_build_object('merchantId', $1::text)) RETURNING id`,
+    [merchantId],
   );
   await pool.query(
-    `INSERT INTO webhook_deliveries (endpoint_id, outbox_event_id, event_type, delivery_event_id, payload, created_at, replay_of_delivery_id)
-     SELECT $1, $2, 'transaction.captured', gen_random_uuid(), '{}', '2026-05-02T00:00:00Z', NULL
+    // status 'succeeded' so these rows never sit in the dispatcher's "due" queue
+    // for other test files sharing this database.
+    `INSERT INTO webhook_deliveries (endpoint_id, outbox_event_id, event_type, delivery_event_id, payload, created_at, replay_of_delivery_id, status)
+     SELECT $1, $2, 'transaction.captured', gen_random_uuid(), '{}', '2026-05-02T00:00:00Z', NULL, 'succeeded'
        FROM generate_series(1, 1) g`,
     [endpointId, outbox.rows[0]!.id],
   );
   // Fill the rest as replays of that row (replays aren't limited to one per event).
   const first = await pool.query<{ id: string }>(`SELECT id FROM webhook_deliveries WHERE endpoint_id = $1`, [endpointId]);
   await pool.query(
-    `INSERT INTO webhook_deliveries (endpoint_id, outbox_event_id, event_type, delivery_event_id, payload, created_at, replay_of_delivery_id)
-     SELECT $1, $2, 'transaction.captured', gen_random_uuid(), '{}', '2026-05-02T00:00:00Z', $3
+    `INSERT INTO webhook_deliveries (endpoint_id, outbox_event_id, event_type, delivery_event_id, payload, created_at, replay_of_delivery_id, status)
+     SELECT $1, $2, 'transaction.captured', gen_random_uuid(), '{}', '2026-05-02T00:00:00Z', $3, 'succeeded'
        FROM generate_series(1, $4::int) g`,
     [endpointId, outbox.rows[0]!.id, first.rows[0]!.id, MAX_ARCHIVE_DELIVERIES],
   );
@@ -265,4 +268,5 @@ test("R5: an archive range with too many deliveries is refused instead of loaded
       }),
     /archive a shorter period/,
   );
+  await pool.query(`DELETE FROM webhook_deliveries WHERE endpoint_id = $1`, [endpointId]);
 });
