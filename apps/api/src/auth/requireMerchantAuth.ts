@@ -124,9 +124,14 @@ export interface MerchantWriterActor {
  * attributes to the session actor the cookie resolved, carrying that actor's
  * id — cookie-borne merchant requests share one persisted actor kind.
  */
-// impersonation writes get recorded as merchant_session here — audit cant tell admin from merchant? — am
-// YA: impersonation can't reach write routes, so this never sees admin_impersonation
+// S13: the old note said impersonation "can't reach write routes" — it could
+// (capture and void had no role gate, and super_admins mapped to owner). If it
+// had, the write would have been recorded as a merchant_session, hiding which
+// admin did it. Impersonation is read-only, so any write path refuses it here.
 export function requireMerchantWriterActor(auth: MerchantAuthContext): MerchantWriterActor {
+  if (auth.actorType === "admin_impersonation") {
+    throw new ForbiddenError("impersonation_is_read_only");
+  }
   if (auth.actorType === "merchant_api_key") {
     return { type: "merchant_api_key", id: auth.actorId };
   }

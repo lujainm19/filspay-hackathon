@@ -81,11 +81,22 @@ export type ImpersonationMerchantRole = "owner" | "finance" | "support";
 /** `admin_users.role` (migration 0031). */
 type AdminUserRole = "support" | "finance" | "super_admin";
 
-/** Maps the admin's role to the merchant-plane role used during impersonation. */
+/**
+ * Maps the admin's role to the merchant-plane role used during impersonation.
+ *
+ * S13 fix: what was wrong — finance staff became "finance" and super_admins
+ * became "owner" inside the merchant's account. Why — the map copied each
+ * admin's power across instead of following the rule in ARCHITECTURE §8 and
+ * the handover ("view as merchant" is read-only support). What it broke — a
+ * super_admin viewing a merchant could issue API keys, create payment links
+ * or change webhook URLs as that merchant, and none of it was attributed to
+ * them. Everyone now views as "support", and write routes refuse
+ * impersonation outright (see requireMerchantWriterActor).
+ */
 const MERCHANT_ROLE_FOR_ADMIN_ROLE: Record<AdminUserRole, ImpersonationMerchantRole> = {
   support: "support",
-  finance: "finance",
-  super_admin: "owner",
+  finance: "support",
+  super_admin: "support",
 };
 
 /** @property merchantRole Always "support" (ARCH §8): a grant is view-only. */
@@ -101,8 +112,11 @@ export interface ImpersonationGrantLookup {
  * called only from `requireMerchantAuth`. Same predicate discipline as every
  * other session-shaped lookup here: never a bare token match.
  */
-// no admin_users.status check here (adminAuth/sessions.ts has one) — disabled admin keeps their grant? — am
-// FH: revoked_at gets set by the admin-disable trigger, so it's covered
+// S15 fix: the grant lookup didn't check admin_users.status, and the
+// "admin-disable trigger" the old comment relied on doesn't exist anywhere in
+// the migrations. So a staff account disabled mid-shift kept its "view as
+// merchant" access until the grant expired. The JOIN now requires an active
+// admin, the same rule the admin session lookup already uses.
 export async function lookupImpersonationGrant(
   pool: Pool,
   rawToken: string,
@@ -120,7 +134,8 @@ export async function lookupImpersonationGrant(
       WHERE g.token_hash = $1
         AND g.revoked_at IS NULL
         AND g.ended_at IS NULL
-        AND g.expires_at > now()`,
+        AND g.expires_at > now()
+        AND au.status = 'active'`,
     [tokenHash],
   );
   const row = result.rows[0];
