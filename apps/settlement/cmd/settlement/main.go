@@ -115,7 +115,13 @@ func main() {
 			onlyMerchant = &id
 		}
 
-		report, err := settlement.RunDailyBatch(ctx, pool, businessDate, onlyMerchant)
+		// T4: same advisory lock as the daemon, so a manual run can't overlap it.
+		var report settlement.DailyBatchReport
+		err = settlement.WithDailyRunLock(ctx, pool, func() error {
+			var runErr error
+			report, runErr = settlement.RunDailyBatch(ctx, pool, businessDate, onlyMerchant)
+			return runErr
+		})
 		if err != nil {
 			log.Fatalf("settlement run-batch: %v", err)
 		}

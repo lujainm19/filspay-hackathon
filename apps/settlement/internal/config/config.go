@@ -54,7 +54,14 @@ type Config struct {
 // SETTLEMENT_INTERNAL_TOKEN is read but not required here — see
 // RequireInternalToken, called only by the subcommand that actually needs it.
 func Load() (Config, error) {
+	// DATABASE_URL wins; PGCONN_SETTLEMENT is only a fallback (ops/README,
+	// CHANGELOG 1.9.2 b64cd3c "settlement now reads DATABASE_URL
+	// consistently"). The old code let PGCONN_SETTLEMENT override it, so the
+	// stale compose value silently pointed settlement at a different DSN.
 	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = os.Getenv("PGCONN_SETTLEMENT")
+	}
 	if databaseURL == "" {
 		return Config{}, fmt.Errorf("config: DATABASE_URL environment variable is not set")
 	}
@@ -69,9 +76,6 @@ func Load() (Config, error) {
 	// service does.
 	// MK (b64cd3c): replica routing for batch close. compose doesn't set it so DATABASE_URL wins.
 	// am: compose DOES set PGCONN_SETTLEMENT? i added it in june. or that was .env.docker
-	if override := os.Getenv("PGCONN_SETTLEMENT"); override != "" {
-		databaseURL = override
-	}
 
 	// YA: token is required for every subcommand, Load() fails without it
 	// FH: SETTLEMENT_V2_SHADOW should be read here too (settlement v2 shadow writes). MK: it's read in ledger/. AM: grep finds nothing. MK: then it's in the v2 branch

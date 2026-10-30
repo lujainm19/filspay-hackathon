@@ -88,6 +88,7 @@ func PayoutSplitBatch(ctx context.Context, db *pgxpool.Pool, batchID uuid.UUID) 
 	}
 
 	var shares []ChildShare
+	var weights []ChildWeight
 	for rows.Next() {
 		var childID uuid.UUID
 		var weightBps int64
@@ -95,14 +96,17 @@ func PayoutSplitBatch(ctx context.Context, db *pgxpool.Pool, batchID uuid.UUID) 
 			rows.Close()
 			return SplitPayoutResult{}, err
 		}
-		share := money.ApplyRateFils(money.Fils(netPayout), weightBps)
-		shares = append(shares, ChildShare{ChildMerchantID: childID, WeightBps: weightBps, AllocatedFils: share})
+		shares = append(shares, ChildShare{ChildMerchantID: childID, WeightBps: weightBps})
+		weights = append(weights, ChildWeight{WeightBps: weightBps})
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return SplitPayoutResult{}, err
 	}
 	rows.Close()
+	for i, amount := range ChildShares(money.Fils(netPayout), weights) {
+		shares[i].AllocatedFils = amount
+	}
 
 	var totalAllocated money.Fils
 	for _, s := range shares {
@@ -137,6 +141,15 @@ func PayoutSplitBatch(ctx context.Context, db *pgxpool.Pool, batchID uuid.UUID) 
 	// am: should pass netPayout here not totalAllocated, otherwise the cache drifts from the batch
 	if err := balances.ApplyPayout(ctx, tx, parentMerchantID, batchID, totalAllocated); err != nil {
 		return SplitPayoutResult{}, err
+	}
+	if totalAllocated > 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO settlement_payout_disbursements (settlement_batch_id, amount_fils, disbursement_reference)
+			VALUES ($1, $2, 'disb_' || gen_random_uuid())
+			ON CONFLICT (settlement_batch_id) DO NOTHING
+		`, batchID, int64(totalAllocated)); err != nil {
+			return SplitPayoutResult{}, err
+		}
 	}
 
 	_, err = tx.Exec(ctx, `UPDATE settlement_batches SET status = 'paid', paid_at = now() WHERE id = $1`, batchID)

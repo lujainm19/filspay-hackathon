@@ -25,11 +25,16 @@ type FeeScheduleRow struct {
 // ascending effective_from order, so CloseBatch's per-event loop (which may
 // need a different row per event, one per calendar day at most in
 // practice) never runs one query per event.
+//
+// Two rows with the same effective_from used to come back in arbitrary
+// order, so Go could pick a different rate than apps/api (which orders by
+// effective_from DESC, created_at DESC). The tie-break now matches: the
+// most recently created row wins, being last in this ascending slice.
 func LoadFeeSchedules(ctx context.Context, tx pgx.Tx, merchantID uuid.UUID) ([]FeeScheduleRow, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT effective_from, mdr_bps FROM fee_schedules
 		 WHERE merchant_id = $1
-		 ORDER BY effective_from ASC
+		 ORDER BY effective_from ASC, created_at ASC, id ASC
 	`, merchantID)
 	if err != nil {
 		return nil, err

@@ -24,10 +24,17 @@ func TruncateToSchemeAmount(grossFils money.Fils) money.Fils {
 	return (grossFils / 10) * 10
 }
 
-// SchemeAmountBD converts a transaction's gross fils to the BD value stored
-// in scheme_export_lines.amount (numeric(10,2)).
-func SchemeAmountBD(grossFils money.Fils) float64 {
-	return float64(grossFils) / 1000.0
+// SchemeAmountBD formats the *truncated* scheme amount as the "D.DD" string
+// stored in scheme_export_lines.amount and written to the scheme file.
+//
+// Finance memo / Visa residue thread: "the scheme statement is always a few
+// fils higher than ours, never under". This used to pass float(gross)/1000
+// into a NUMERIC(10,2) column, which Postgres *rounds* half-up — so the file
+// said 93.28 for a 93,275-fil line while amount_fils said 93,270. We were
+// asking the scheme for more than we recorded, on every line with a third
+// decimal >= 5. Not Visa's BIN-range rounding: "Visa didn't make the file".
+func SchemeAmountBD(grossFils money.Fils) string {
+	return formatFilsAsTwoDecimalString(TruncateToSchemeAmount(grossFils))
 }
 
 // buildBatchClosedPayload builds the settlement.batch_closed outbox
@@ -68,7 +75,9 @@ type SchemeExportLine struct {
 func LoadSchemeExportLines(ctx context.Context, db *pgxpool.Pool, batchID uuid.UUID) ([]SchemeExportLine, error) {
 	rows, err := db.Query(ctx, `
 		SELECT sel.line_sequence, t.acquirer_reference,
-		       COALESCE(sel.amount, sel.amount_fils::numeric / 1000)::text
+		       -- amount_fils is the authoritative, already-truncated figure; the
+		       -- stored amount column held a rounded-up value for old rows.
+		       (sel.amount_fils::numeric / 1000)::numeric(12, 2)::text
 		  FROM scheme_export_lines sel
 		  JOIN transactions t ON t.id = sel.transaction_id
 		 WHERE sel.settlement_batch_id = $1

@@ -83,14 +83,19 @@ func EnqueuePayoutNotifications(ctx context.Context, db *pgxpool.Pool) (int, err
 		if err != nil {
 			return count, fmt.Errorf("settlement: EnqueuePayoutNotifications: marshal payload: %w", err)
 		}
-		_, err = db.Exec(ctx, `
+		// Incident 2026-08-21: daemon and a CLI run both passed the NOT EXISTS
+		// check and both inserted. ("Claude: outbox_events has a unique index
+		// on (event_type, aggregate_id)" — it did not.) The unique index now
+		// exists (migration 0073) and the insert is a no-op on conflict.
+		tag, err := db.Exec(ctx, `
 			INSERT INTO outbox_events (event_type, aggregate_type, aggregate_id, payload)
 			VALUES ('settlement.paid', 'settlement_batch', $1, $2)
+			ON CONFLICT (aggregate_id) WHERE event_type = 'settlement.paid' DO NOTHING
 		`, b.id, payload)
 		if err != nil {
 			return count, fmt.Errorf("settlement: EnqueuePayoutNotifications: insert batch %s: %w", b.id, err)
 		}
-		count++
+		count += int(tag.RowsAffected())
 	}
 	return count, nil
 }
