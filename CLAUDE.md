@@ -61,7 +61,9 @@ cd apps/settlement && DATABASE_URL=... go test -p 1 ./...
 Tests are not sacred: several old tests asserted the bugs (e.g. 4.75 BD =
 475 fils). If a test contradicts the ADRs/handover, fix the test and say why
 in the test itself. Add a regression test for every bug fixed
-(`apps/api/src/hackathonRegressions.test.ts`, `*_fixes_test.go`).
+(`apps/api/src/**/*.new.test.ts`, `apps/api/src/partnerRegressions.test.ts`,
+`apps/settlement/internal/**/*_fixes_test.go`). The index of every finding
+and its test is `docs/FINDINGS.md`.
 
 ## What the old files got wrong (do not reintroduce)
 
