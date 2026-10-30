@@ -134,3 +134,41 @@ test("W2: a replay keeps the original Webhook-Delivery-Id, and a replayed settle
   );
   assert.equal(Number(disbursements.rows[0]!.n), 1);
 });
+
+test("C4: a merchant with two webhook endpoints gets settlement.paid on both, and the batch gets one disbursement", async () => {
+  // 0073 made disbursements one-per-batch, but the effect still ran once per
+  // delivery row (one per endpoint), so the second endpoint's delivery threw
+  // on the unique index and was retried forever without ever being sent.
+  const { merchantId, url } = await merchantWithEndpoint("c4");
+  const secondUrl = `http://receiver-${randomUUID()}.test/hook`;
+  await createWebhookEndpoint(pool, config, {
+    merchantId,
+    url: secondUrl,
+    createdByType: "merchant_session",
+    createdById: randomUUID(),
+  });
+  const batch = await pool.query<{ id: string }>(
+    `INSERT INTO settlement_batches (merchant_id, batch_date, status, gross_fils, fee_fils, net_payout_fils)
+     VALUES ($1, '2026-09-02', 'paid', 10000, 250, 9750) RETURNING id`,
+    [merchantId],
+  );
+  const batchId = batch.rows[0]!.id;
+  await enqueueEvent(pool, {
+    eventType: "settlement.paid",
+    aggregateType: "settlement_batch",
+    aggregateId: batchId,
+    payload: { merchantId, batchId, batchDate: "2026-09-02", netPayoutFils: 9_750 },
+  });
+  const sent: string[] = [];
+  const transport: WebhookTransport = async (req) => {
+    if (req.url === url || req.url === secondUrl) sent.push(req.url);
+    return { statusCode: 200, body: "ok" };
+  };
+  await runDispatchPass(pool, transport, config);
+  assert.deepEqual([...sent].sort(), [url, secondUrl].sort());
+  const disbursements = await pool.query<{ n: string }>(
+    `SELECT count(*) AS n FROM settlement_payout_disbursements WHERE settlement_batch_id = $1`,
+    [batchId],
+  );
+  assert.equal(Number(disbursements.rows[0]!.n), 1);
+});
