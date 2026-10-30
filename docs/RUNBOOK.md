@@ -6,9 +6,9 @@ incident, not during.
 ## Health
 
 - `GET /healthz` — the process answers. That's all it tells you.
-- `GET /readyz` — the API reached Postgres when it booted. It does not
-  re-check afterwards; a green `/readyz` says nothing about the database
-  right now. To check the database, run a query.
+- `GET /readyz` — the API reached Postgres when it booted (boot-only).
+- `GET /healthz/db` — live database probe; the container healthcheck uses it
+  and restarts an API that has lost its database.
 
 > **FH:** the FP-215 PR description says readyz re-checks every 30s now. not sure it merged
 >
@@ -69,8 +69,9 @@ carries `readModelAsOf`. If it's stuck:
 npx tsx apps/reporting/src/index.ts catch-up
 ```
 
-`catch-up` shares the worker's cursor, so it's safe to run while the worker
-is up. Then check the reporting worker is running and connected.
+`catch-up` shares the worker's cursor; the cursor row is locked per pass, so
+the two can no longer double-apply. Malformed events are moved to
+`reporting_dead_letters` instead of stalling the worker — check that table. Then check the reporting worker is running and connected.
 
 If `readModelAsOf` is `null` after a fresh seed, restart the worker; it
 usually needs a couple of restarts while Postgres warms up.
@@ -92,9 +93,9 @@ usually needs a couple of restarts while Postgres warms up.
 >
 > **— M?** bad deploy, rolled back
 
-If a merchant reports that signatures don't verify, ask them to parse the
-body and re-serialise it with sorted keys before computing the HMAC; some
-HTTP frameworks reorder JSON keys.
+If a merchant reports that signatures don't verify: they must compute the
+HMAC over the **raw request body** (`t.<raw body>`). We now sign exactly the
+bytes we send (FP-240).
 
 > **MK:** if signatures don't verify over the raw body, that's on us. FP-240
 
@@ -120,8 +121,9 @@ boundary"), finance runs a month-end script modelled on
 2. Run it once against production with finance on the call.
 3. Attach the log from `scripts/out/` to the month-end ticket.
 
-The script checks for an existing posting with the same description, so a
-second run is a no-op.
+From April 2026, CloseBatch journals residue itself; no month-end script is
+needed. `scripts/reconcile_march.ts` (March only) is a dry run unless
+`--apply`, uses the Bahrain month, and refuses to post twice.
 
 > **Huda** (#fp-finance): please don't run anything for April onwards until March (FP-187) is resolved
 

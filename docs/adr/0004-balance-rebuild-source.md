@@ -29,3 +29,11 @@ The CLI keeps the ledger walk for engineering use.
   settled activity.
 - Manual corrections made with **Adjust balance** are cache-only, so
   they are overwritten by a rebuild and must be re-applied afterwards.
+
+
+## Superseded (Oct 2026 review, FP-203)
+
+The "faster query path" summed scheme export lines — gross batched captures
+with fees, payouts, refunds and credits ignored. That is not a balance (Alpha
+Retail: 135K → 7K). The console button now runs the same ledger rebuild as
+the CLI, with an index (migration 0073) for speed.

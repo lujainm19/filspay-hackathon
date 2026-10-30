@@ -32,3 +32,11 @@ UI yet.
   corrections.
 - A balance rebuild resets the cache, so corrections must be re-applied
   after a rebuild. Support's workflow is Rebuild, then Adjust.
+
+
+## Superseded (Oct 2026 review)
+
+Cache-only "display corrections" were wiped by every rebuild and made the
+dashboard disagree with statements and payouts. **Adjust balance** now uses
+the journaled variant (a balanced ledger entry plus the cache update), which
+is what ADMIN.md always described.

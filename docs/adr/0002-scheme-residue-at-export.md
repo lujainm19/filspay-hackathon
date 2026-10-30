@@ -45,3 +45,12 @@ because March closed before the CloseBatch change was deployed.
   0007 seed).
 - The scheme file `amount` must be exactly `amount_fils / 1000` formatted to
   two decimals, or the residue is wrong.
+
+
+## Review note (Oct 2026)
+
+The "implemented in CloseBatch, 2026-03" status was false: nothing posted
+residue (handover). It is now implemented in `CloseBatch` exactly as decided
+above, and the scheme `amount` is the truncated figure (it used to be rounded
+half-up by the NUMERIC(10,2) column, which is why the scheme statement was
+always higher than our file).
