@@ -84,7 +84,7 @@ func runIfDue(ctx context.Context, db *pgxpool.Pool, runDelayMinutes int) {
 	if now.Before(dueAt) {
 		// The grace period after today's Bahrain midnight hasn't elapsed
 		// yet; nothing new to do this tick.
-		logNextRunEstimate(now)
+		logNextRunEstimate(now, runDelayMinutes)
 		return
 	}
 	// am: logs show the close ~03:15 local not 00:15?? whatever, it runs. yalla
@@ -125,5 +125,5 @@ func runIfDue(ctx context.Context, db *pgxpool.Pool, runDelayMinutes int) {
 		log.Printf("settlement daemon: %v", err)
 	}
 
-	logNextRunEstimate(now)
+	logNextRunEstimate(now, runDelayMinutes)
 }

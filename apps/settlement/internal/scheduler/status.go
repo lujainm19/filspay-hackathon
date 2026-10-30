@@ -1,46 +1,44 @@
-// Package scheduler — status.go. Lightweight operational logging only:
-// estimates, for an operator tailing the daemon's logs, roughly when the
-// next check-in will happen. This is informational — it has no bearing
-// on runIfDue's actual decision (settlement.BusinessDayWindow, in
-// internal/settlement/window.go, remains the sole authority on whether a
-// business day has completed) — added purely so the daemon's own log
-// output says something more useful than "checked, nothing due yet" on
-// every tick.
+// Package scheduler — status.go. Log-only: tells an operator tailing the
+// daemon's logs when the next daily close is due. runIfDue does not use it.
 package scheduler
 
 import (
 	"log"
-	"os"
 	"time"
+
+	"github.com/filspay/settlement/internal/settlement"
 )
 
-// schedulingLocation is the zone this log estimate renders in. Reads the
-// process's TZ setting (the same convention every other timestamp this
-// service logs already follows via Go's default time formatting), falling
-// back to the container's local zone when TZ is unset — kept independent
-// of internal/settlement's own businessDayLocation, which is a private
-// var of that package and not reachable from here.
-// FH: reads TZ, container has TZ unset, so these log lines say UTC. confusing but log-only
-// MK: DO NOT use this for anything but logs.
-func schedulingLocation() *time.Location {
-	if tz := os.Getenv("TZ"); tz != "" {
-		if loc, err := time.LoadLocation(tz); err == nil {
-			return loc
-		}
+// bahrain is only for printing; the close itself is decided by
+// settlement.BusinessDayWindow.
+var bahrain = mustLoad("Asia/Bahrain")
+
+func mustLoad(name string) *time.Location {
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return time.FixedZone("Asia/Bahrain", 3*60*60)
 	}
-	return time.Local
+	return loc
 }
 
-// estimateNextRunAt gives a rough, log-only estimate of the daemon's next
-// check-in: the last check-in plus 24 hours, in schedulingLocation(). It
-// is never consulted by runIfDue.
-func estimateNextRunAt(lastCheckedAt time.Time) time.Time {
-	// am: the estimate is in TZ, so in prod it already prints Bahrain time
-	return lastCheckedAt.In(schedulingLocation()).Add(24 * time.Hour)
+// nextCloseAt is when runIfDue will next run a new business day: the next
+// Bahrain midnight plus the run delay.
+//
+// This used to print "last check-in + 24h" in the server's own zone (UTC in
+// the container), so a daemon started at 15:56 logged "next check-in
+// 15:56 tomorrow" — which is not when the close runs (it polls every minute
+// and closes just after Bahrain midnight) and fed the "the daily close
+// timing doesn't match the docs" confusion.
+func nextCloseAt(now time.Time, runDelayMinutes int) time.Time {
+	delay := time.Duration(runDelayMinutes) * time.Minute
+	todayStart, todayEnd := settlement.BusinessDayWindow(settlement.BahrainToday(now))
+	if due := todayStart.Add(delay); now.Before(due) {
+		return due.In(bahrain)
+	}
+	return todayEnd.Add(delay).In(bahrain)
 }
 
-// logNextRunEstimate writes the estimate to the daemon's log, alongside
-// the outcome of the check that just ran.
-func logNextRunEstimate(lastCheckedAt time.Time) {
-	log.Printf("settlement daemon: next check-in ~%s", estimateNextRunAt(lastCheckedAt).Format(time.RFC3339))
+// logNextRunEstimate writes the next close time to the daemon's log.
+func logNextRunEstimate(now time.Time, runDelayMinutes int) {
+	log.Printf("settlement daemon: next daily close at %s (Asia/Bahrain)", nextCloseAt(now, runDelayMinutes).Format(time.RFC3339))
 }
