@@ -5,7 +5,9 @@ dist/
 .env.local
 npm-debug.log*
 .DS_Store
-.claude/
+# Shared AI setup (.claude/settings.json, .claude/commands/) is tracked;
+# personal overrides are not.
+.claude/settings.local.json
 # S20: any env file holds secrets — never track them (only *.example)
 .env*
 ops/.env*

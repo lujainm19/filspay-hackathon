@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(npm test:*)",
+      "Bash(npm run migrate)",
+      "Bash(npm run typecheck)",
+      "Bash(npx tsx --test:*)",
+      "Bash(npx tsc:*)",
+      "Bash(go test:*)",
+      "Bash(go vet:*)",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(./scripts/ai/fresh_test.sh)"
+    ],
+    "ask": [
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(npm run seed)",
+      "Bash(psql:*)",
+      "Bash(docker compose:*)"
+    ],
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(rm -rf:*)",
+      "Read(ops/.env)",
+      "Read(ops/.env.*)",
+      "Read(./.env)",
+      "Read(./.env.*)"
+    ]
+  }
+}
