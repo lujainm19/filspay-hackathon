@@ -6,7 +6,8 @@ import { authorizeTransaction, type AuthorizeInput } from "../payments/authorize
 import { captureTransaction } from "../payments/capture.js";
 import { applyCaptureDiscountAdjustment } from "../payments/discountAdjustment.js";
 import { voidTransaction } from "../payments/void.js";
-import { buildTransactionsExportCsv } from "../transactions/exportCsv.js";
+import { Readable } from "node:stream";
+import { transactionsExportCsvLines } from "../transactions/exportCsv.js";
 import { getTransactionById, listTransactions } from "../transactions/query.js";
 import { listTransactionEvents } from "../transactions/events.js";
 import { BadRequestError, NotFoundError } from "../lib/errors.js";
@@ -159,17 +160,21 @@ export async function transactionRoutes(app: FastifyInstance): Promise<void> {
       const q = request.query;
       const status = q.status === undefined ? undefined : Array.isArray(q.status) ? q.status : [q.status];
 
-      const csv = await buildTransactionsExportCsv(app.db, {
-        merchantId: request.merchantAuth!.merchantId,
-        from: q.from ? new Date(q.from) : undefined,
-        to: q.to ? new Date(q.to) : undefined,
-        status,
-      });
-
-      reply
+      const from = q.from ? new Date(q.from) : undefined;
+      const to = q.to ? new Date(q.to) : undefined;
+      if ((from && Number.isNaN(from.getTime())) || (to && Number.isNaN(to.getTime()))) {
+        throw new BadRequestError("invalid_request", "from and to must be valid ISO-8601 timestamps");
+      }
+      // R4 fix: stream the CSV a page at a time instead of building it all in
+      // memory first (see transactionsExportCsvLines).
+      const stream = Readable.from(
+        transactionsExportCsvLines(app.db, { merchantId: request.merchantAuth!.merchantId, from, to, status }),
+        { objectMode: false }, // a byte stream, so Fastify can pipe it to the socket
+      );
+      return reply
         .header("content-type", "text/csv; charset=utf-8")
         .header("content-disposition", 'attachment; filename="transactions.csv"')
-        .send(csv);
+        .send(stream);
     },
   );
 
