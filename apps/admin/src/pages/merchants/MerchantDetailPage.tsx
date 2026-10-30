@@ -90,7 +90,7 @@ export function MerchantDetailPage() {
     }
   }
 
-  /** The old key keeps working for a 24h overlap window, then stops. */
+  /** A3: the old key is revoked immediately (the UI warning below already says so). */
   async function handleRotate(keyId: string): Promise<void> {
     if (!id) return;
     setBusy(true);
