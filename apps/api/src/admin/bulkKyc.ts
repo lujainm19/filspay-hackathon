@@ -24,9 +24,14 @@ export async function bulkApproveMerchantsKyc(
 ): Promise<BulkApproveMerchantsKycResult> {
   return withTransaction(pool, async (client) => {
     const result = await client.query<{ id: string }>(
+      // A5 fix: what was wrong — no status filter. Why it matters — ADMIN.md
+      // promises "only merchants currently under_review are affected". What
+      // it broke — ticking a rejected (or never-submitted) merchant approved it
+      // for live payments with no review. The returned ids (and the audit row)
+      // show exactly which ones were approved.
       `UPDATE merchants
           SET onboarding_status = 'approved', kyc_passed = true
-        WHERE id = ANY($1::uuid[])
+        WHERE id = ANY($1::uuid[]) AND onboarding_status = 'under_review'
       RETURNING id`,
       [input.merchantIds],
     );

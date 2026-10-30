@@ -569,6 +569,10 @@ test("a forced audit-write failure rolls the WHOLE bulk approval back", async ()
   const finance = await signedInAdmin("finance", "bulkkyc-auditfail");
   const first = await createMerchant("bulkkyc-auditfail-a");
   const second = await createMerchant("bulkkyc-auditfail-b");
+  // A5: bulk approve only touches merchants that are under review.
+  await pool.query(`UPDATE merchants SET onboarding_status = 'under_review' WHERE id = ANY($1)`, [
+    [first.merchantId, second.merchantId],
+  ]);
 
   await pool.query(
     `ALTER TABLE admin_audit_log
@@ -593,7 +597,7 @@ test("a forced audit-write failure rolls the WHOLE bulk approval back", async ()
   assert.equal(merchants.rowCount, 2);
   for (const row of merchants.rows) {
     assert.equal(row.kyc_passed, false, "the batch UPDATE must have rolled back for every merchant");
-    assert.equal(row.onboarding_status, "submitted");
+    assert.equal(row.onboarding_status, "under_review");
   }
   assert.equal((await auditRowsFor(finance.id, "kyc_bulk_approve")).length, 0);
 
@@ -1640,4 +1644,27 @@ test("an mdr recalculation whose audit row cannot be written never makes the cal
     0,
     "an unloggable action must be BLOCKED, not merely unlogged",
   );
+});
+
+test("A5: bulk approve only approves merchants that are under review", async () => {
+  const finance = await signedInAdmin("finance", "bulkkyc-status");
+  const reviewing = await createMerchant("bulkkyc-status-review");
+  const rejected = await createMerchant("bulkkyc-status-rejected");
+  await pool.query(`UPDATE merchants SET onboarding_status = 'under_review' WHERE id = $1`, [reviewing.merchantId]);
+  await pool.query(`UPDATE merchants SET onboarding_status = 'rejected' WHERE id = $1`, [rejected.merchantId]);
+
+  const res = await app.inject({
+    method: "POST",
+    url: "/v1/admin/merchants/bulk-approve",
+    headers: { cookie: finance.cookie },
+    payload: { merchantIds: [reviewing.merchantId, rejected.merchantId] },
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  const rows = await pool.query<{ id: string; onboarding_status: string }>(
+    `SELECT id, onboarding_status FROM merchants WHERE id = ANY($1)`,
+    [[reviewing.merchantId, rejected.merchantId]],
+  );
+  const byId = new Map(rows.rows.map((r) => [r.id, r.onboarding_status]));
+  assert.equal(byId.get(reviewing.merchantId), "approved");
+  assert.equal(byId.get(rejected.merchantId), "rejected", "a rejected merchant must not be bulk-approved");
 });
