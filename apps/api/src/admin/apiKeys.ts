@@ -28,14 +28,18 @@ export async function rotateApiKeyAsAdmin(
       throw new ConflictError("api_key_already_revoked");
     }
 
-    // A3 fix: what was wrong — rotation issued a new key but never revoked the
-    // old one. Why it matters — the usual reason to rotate is that the old key
-    // leaked; YA's handover is explicit that "rotation = revoke" (there was
-    // never a grace period). What it broke — a leaked key kept working forever
-    // after support "rotated" it. The old key is revoked in this same
-    // transaction, so a failed rotation still leaves the merchant with a key.
+    // A3 fix: what was wrong — rotation issued a new key but never retired the
+    // old one, so it kept working forever. Why it matters — the usual reason to
+    // rotate is that the old key leaked. What it broke — a leaked key still
+    // worked after support "rotated" it.
+    // Team decision (docs/PARTNER_FIXES.md): give the merchant a 24-hour
+    // overlap to deploy the new key, then the old one stops. We use the
+    // revoke_after column from 0056 and verifyApiKey checks it, so there's no
+    // sweep job to forget to run. (For a key that's known to have leaked, the
+    // right move is an immediate revoke, not a rotation.)
     await client.query(
-      `UPDATE api_keys SET revoked_at = now(), revoked_reason = 'rotated' WHERE id = $1`,
+      `UPDATE api_keys SET revoke_after = now() + interval '24 hours'
+        WHERE id = $1 AND (revoke_after IS NULL OR revoke_after > now() + interval '24 hours')`,
       [input.apiKeyId],
     );
 

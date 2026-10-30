@@ -90,7 +90,7 @@ export function MerchantDetailPage() {
     }
   }
 
-  /** A3: the old key is revoked immediately (the UI warning below already says so). */
+  /** The old key keeps working for a 24h overlap window, then stops (A3). */
   async function handleRotate(keyId: string): Promise<void> {
     if (!id) return;
     setBusy(true);
@@ -536,9 +536,9 @@ export function MerchantDetailPage() {
       {pendingRotation ? (
         <div className="admin-confirm">
           <p>
-            <strong>Rotate this API key?</strong> The current key is revoked and a replacement is
-            issued in the same transaction, so the merchant is never left without a working key —
-            but any integration still sending the old key will start failing immediately.
+            <strong>Rotate this API key?</strong> A replacement is issued straight away and the
+            current key keeps working for 24 hours, so the merchant has time to switch — after that,
+            any integration still sending the old key will start failing.
           </p>
           <label>
             Label for the new key (optional)
