@@ -58,16 +58,18 @@ test("applyAdjustmentImport records the batch and its rows", async () => {
   });
 
   assert.equal(result.rowCount, 2);
-  assert.equal(result.totalPostedFils, 600);
+  assert.equal(result.totalPostedFils, 6_000); // M1: 4.75 + 1.25 BD = 6.000 BD = 6000 fils
 
   const rows = await getAdjustmentImportRows(pool, result.importId);
   assert.equal(rows.length, 2);
   assert.equal(rows[0]!.rowNumber, 1);
   assert.equal(rows[0]!.rawAmountText, "4.75");
-  assert.equal(rows[0]!.parsedAmountFils, 475);
+  // M1: 4.75 BD is 4750 fils (1 BD = 1000 fils). This used to expect 475,
+  // which locked in the ten-times-too-small bug.
+  assert.equal(rows[0]!.parsedAmountFils, 4_750);
   assert.equal(rows[0]!.reason, "statement correction");
   assert.equal(rows[1]!.rawAmountText, "1.25");
-  assert.equal(rows[1]!.parsedAmountFils, 125);
+  assert.equal(rows[1]!.parsedAmountFils, 1_250); // M1: 1.25 BD = 1250 fils
   assert.equal(rows[1]!.reason, null);
 });
 
@@ -121,9 +123,10 @@ test("applyAdjustmentImport reverses leg direction for a negative amount", async
   );
   assert.deepEqual(
     legs.rows.map((r) => [r.account_id, r.direction, Number(r.amount_fils)]),
+      // M1: -3.50 BD is 3500 fils each way (was 350).
     [
-      ["manual_balance_adjustment_contra", "credit", 350],
-      ["merchant_payable", "debit", 350],
+      ["manual_balance_adjustment_contra", "credit", 3_500],
+      ["merchant_payable", "debit", 3_500],
     ],
   );
 });
@@ -145,7 +148,7 @@ test("applyAdjustmentImport updates the merchant balance cache", async () => {
     `SELECT cached_payable_fils FROM merchant_balances WHERE merchant_id = $1`,
     [merchantId],
   );
-  assert.equal(Number(balance.rows[0]!.cached_payable_fils), 500);
+  assert.equal(Number(balance.rows[0]!.cached_payable_fils), 5_000); // M1: 4.00 + 1.00 BD = 5000 fils
 });
 
 test("applyAdjustmentImport links each row to its ledger group", async () => {
