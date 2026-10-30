@@ -11,6 +11,7 @@ import {
   type AdminRole,
 } from "../adminAuth/sessions.js";
 import { withTransaction } from "../db/withTransaction.js";
+import { randomToken } from "../lib/crypto.js";
 import { BadRequestError, GoneError, TooManyRequestsError, UnauthorizedError } from "../lib/errors.js";
 
 /**
@@ -144,26 +145,34 @@ export async function adminAuthRoutes(app: FastifyInstance): Promise<void> {
       throw new GoneError("otp_expired");
     }
 
-    // admin path doesn't have the merchant race, the challenge row is read FOR UPDATE — MK
-    if (challenge.attempt_count >= challenge.max_attempts) {
+    // S3 fix: the comment here claimed the row was read FOR UPDATE; it wasn't.
+    // Same check-then-act race as the merchant login: parallel guesses all saw
+    // attempt_count = 0, so the 5-try limit didn't hold on the most powerful
+    // login we have. Each guess now claims an attempt atomically first.
+    const claimed = await app.db.query(
+      `UPDATE admin_otp_challenges SET attempt_count = attempt_count + 1
+        WHERE id = $1 AND consumed_at IS NULL AND attempt_count < max_attempts
+        RETURNING attempt_count`,
+      [challenge.id],
+    );
+    if (!claimed.rows[0]) {
       await revokeAdminSession(app.db, pending.adminSessionId);
       throw new TooManyRequestsError("too_many_attempts");
     }
 
     const matches = verifyOtpCode(code, challenge.code_salt, challenge.code_hash);
     if (!matches) {
-      await app.db.query(
-        `UPDATE admin_otp_challenges SET attempt_count = attempt_count + 1 WHERE id = $1`,
-        [challenge.id],
-      );
       throw new UnauthorizedError("invalid_code");
     }
+
+    // S16 fix: new cookie value once the OTP passes (see promoteAdminSession).
+    const newRawToken = randomToken(32);
 
     const adminUser = await withTransaction(app.db, async (client) => {
       await client.query(`UPDATE admin_otp_challenges SET consumed_at = now() WHERE id = $1`, [
         challenge.id,
       ]);
-      await promoteAdminSession(client, pending.adminSessionId, app.config.adminSessionTtlHours);
+      await promoteAdminSession(client, pending.adminSessionId, app.config.adminSessionTtlHours, newRawToken);
       const result = await client.query<{ role: AdminRole }>(
         `SELECT role FROM admin_users WHERE id = $1`,
         [pending.adminUserId],
@@ -176,9 +185,7 @@ export async function adminAuthRoutes(app: FastifyInstance): Promise<void> {
 
     // Re-set the cookie so its browser-side lifetime matches the now-promoted
     // session's full TTL rather than the short pending window.
-    // YA: why is the cookie set twice (login and verify)? Claude says remove one
-    // FH: the second one re-issues at the full session TTL. the merchant flow should do the same
-    reply.setCookie(app.config.adminCookieName, rawToken, {
+    reply.setCookie(app.config.adminCookieName, newRawToken, {
       httpOnly: true,
       path: "/",
       sameSite: "lax",

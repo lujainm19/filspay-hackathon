@@ -141,7 +141,9 @@ async function loginAdmin(email: string): Promise<string> {
     payload: { code: loginBody.devOtpCode },
   });
   assert.equal(verifyRes.statusCode, 200, verifyRes.body);
-  return cookie;
+  // S16: verify rotates the admin cookie; keep the new one like a browser would.
+  const freshCookie = parseCookie(verifyRes.headers["set-cookie"], config.adminCookieName);
+  return freshCookie;
 }
 
 async function signedInAdmin(role: AdminRole, label: string) {

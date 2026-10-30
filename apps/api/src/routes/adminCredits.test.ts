@@ -79,8 +79,10 @@ async function signedInAdmin(role: AdminRole, label: string) {
     payload: { code: loginBody.devOtpCode },
   });
   assert.equal(verifyRes.statusCode, 200, verifyRes.body);
+  // S16: verify rotates the admin cookie; keep the new one like a browser would.
+  const freshCookie = parseCookie(verifyRes.headers["set-cookie"], config.adminCookieName);
 
-  return { id: inserted.rows[0]!.id, email, cookie };
+  return { id: inserted.rows[0]!.id, email, cookie: freshCookie };
 }
 
 async function createMerchant(label: string, mdrBps = 250): Promise<string> {
