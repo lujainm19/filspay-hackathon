@@ -60,9 +60,13 @@ async function insertDelivery(
   opts: { eventType: string; createdAt: string },
 ): Promise<string> {
   const outbox = await pool.query<{ id: string }>(
+    // A realistic payload (merchant + amount), not '{}': the reporting worker
+    // shares this test database and treats an event with no merchant as broken.
     `INSERT INTO outbox_events (event_type, aggregate_type, aggregate_id, payload)
-     VALUES ($1, 'transaction', $2, '{}'::jsonb) RETURNING id`,
-    [opts.eventType, randomUUID()],
+     VALUES ($1, 'transaction', $2,
+             jsonb_build_object('merchantId', (SELECT merchant_id FROM webhook_endpoints WHERE id = $3)::text,
+                                'amountCapturedFils', 0)) RETURNING id`,
+    [opts.eventType, randomUUID(), endpointId],
   );
   const outboxEventId = outbox.rows[0]!.id;
 
