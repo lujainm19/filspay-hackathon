@@ -7,7 +7,21 @@ set -euo pipefail
 if ! command -v docker >/dev/null 2>&1; then
   curl -fsSL https://get.docker.com | sh
 fi
-systemctl enable --now docker
+# Docker DNS: on this provider's image the containers inherited the host's
+# 127.0.0.53 stub resolver, which they can't reach, so Caddy could not reach
+# Let's Encrypt for the HTTPS certificate. Use public resolvers instead.
+if [ ! -f /etc/docker/daemon.json ]; then
+  echo '{"dns": ["1.1.1.1", "8.8.8.8"]}' > /etc/docker/daemon.json
+fi
+systemctl enable docker
+systemctl restart docker
+
+# The provider image ships Nginx on port 80; Caddy (ops/Caddyfile) needs 80/443.
+if systemctl list-unit-files nginx.service >/dev/null 2>&1; then
+  systemctl stop nginx || true
+  systemctl disable nginx || true
+  systemctl mask nginx || true
+fi
 
 # 2. 2 GB swap: building the images needs more than 2 GB RAM for a moment.
 if ! swapon --show | grep -q /swapfile; then
