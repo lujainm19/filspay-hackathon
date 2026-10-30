@@ -6,6 +6,7 @@ import { formatIsoDate } from "./lib/dateFormat.js";
 import { startWebhookDispatcher, type WebhookDispatcherHandle } from "./webhooks/dispatcher.js";
 import { createFetchTransport } from "./webhooks/transport.js";
 import { recoverStuckPaymentLinks } from "./paymentLinks/pay.js";
+import { recoverStuckRefunds } from "./payments/processRefund.js";
 
 async function main(): Promise<void> {
   const config = loadConfig(process.env);
@@ -40,6 +41,12 @@ async function main(): Promise<void> {
         if (n > 0) console.log(`[index] recovered ${n} payment link(s) left mid-capture`);
       })
       .catch((err: unknown) => console.error("[index] payment link recovery failed", err));
+    // C2: refunds left 'pending' by a crash between reserving and settling.
+    recoverStuckRefunds(pool, app.acquirer, 120)
+      .then((n) => {
+        if (n > 0) console.log(`[index] retried ${n} refund(s) left pending`);
+      })
+      .catch((err: unknown) => console.error("[index] refund recovery failed", err));
   };
   recoverLinks();
   const recoveryTimer = setInterval(recoverLinks, 60_000);
