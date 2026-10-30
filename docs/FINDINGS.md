@@ -7,6 +7,11 @@ test that proves the fix. IDs are the report's IDs (S security, M money,
 C concurrency, T settlement timing, A admin console, W webhooks, R
 reliability/ops, N found during final end-to-end verification).
 
+AI setup: `CLAUDE.md` (rules, checked against code), `AGENTS.md` and
+`.cursorrules` (pointers to it), `.claude/settings.json` (permissions),
+`.claude/commands/` (`/verify-finding`, `/full-check`, `/smoke`),
+`scripts/ai/fresh_test.sh`, `scripts/e2e_smoke.ts`.
+
 Ghadah's branch notes (`docs/PARTNER_FIXES.md`) used their own labels for
 some of the same bugs; the table below is the one to quote.
 
@@ -15,7 +20,7 @@ some of the same bugs; the table below is the one to quote.
 ```bash
 npm ci
 DATABASE_URL=postgres://... npm run migrate        # 0001–0076 on an empty DB
-DATABASE_URL=postgres://... npm test               # 491 TS tests, one run
+DATABASE_URL=postgres://... npm test               # 492 TS tests, one run
 cd apps/settlement && DATABASE_URL=... go test -p 1 ./...
 ```
 
@@ -137,6 +142,7 @@ scripts, DB, ops). Status: ✅ fixed and tested · ⚖️ kept by design (reason
 | N3 | Low | `rebuild-balances --merchant` printed but never saved | L | ✅ | `ledger/lujain_fixes_test.go` |
 | N4 | Low | Daemon logged "next check-in" as now + 24 h in UTC | L | ✅ | `scheduler/status_test.go` |
 | N5 | Low | Test fixture made `npm test` fail in one run (poison events) | L | ✅ | full suite green in one run |
+| N6 | High | Reconciliation showed a fake gap equal to the payouts for any period longer than a day | L | ✅ | `routes/settlement.test.ts` (two-day test) |
 
 ## Team decisions (option chosen where two fixes were possible)
 
